@@ -1,0 +1,112 @@
+name: Release
+
+# Runs whenever a tag matching v*.*.* (e.g. v0.2.0) is pushed. Push a
+# tag to trigger it:
+#
+#   git tag v0.2.0
+#   git push origin v0.2.0
+#
+# Each matrix entry cross-builds a release binary for one platform,
+# packages it with README.md/config.example.json, and the final job
+# collects every package into one GitHub Release attached to that tag.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Must match `name` in Cargo.toml - this is the binary cargo
+  # produces, before any platform-specific extension/renaming below.
+  BIN_NAME: icsdrone-rs
+
+permissions:
+  contents: write # needed to create the release and upload assets
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-ubuntu-linux
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Bundles the binary together with the docs/example config a
+      # user needs to actually run it, so the release asset is
+      # self-contained rather than just a bare executable.
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          stage="${BIN_NAME}-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$stage/"
+          cp README.md config.example.json "$stage/"
+          tar czf "${stage}.tar.gz" "$stage"
+          echo "ASSET=${stage}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "${env:BIN_NAME}-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "$stage/"
+          Copy-Item README.md, config.example.json "$stage/"
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          echo "ASSET=$stage.zip" >> $env:GITHUB_ENV
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create/update the release with all assets attached
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

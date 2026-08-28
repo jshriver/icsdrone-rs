@@ -1,0 +1,14 @@
+{
+  "Host": "nightmare-chess.nl",
+  "Port": 5000,
+  "Username": "YourHandle",
+  "Password": "yourpass",
+  "Engine": "./yourengine",
+  "Kibitz": "Yes",
+  "engine_options": {
+    "Hash": "1024",
+    "Threads": "4",
+    "SyzygyPath": "/path/to/syzygy"
+  },
+  "Book": "file.bin"
+}
