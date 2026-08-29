@@ -75,9 +75,15 @@ impl App {
             );
         }
 
-        let book = match &config_file.book {
-            Some(path) => Some(OpeningBook::load(path)?),
-            None => None,
+        let book = match config_file.resolve_book_path() {
+            Some(path) => {
+                info!("Loading opening book: {}", path.display());
+                Some(OpeningBook::load(path)?)
+            }
+            None => {
+                info!("No opening book configured");
+                None
+            }
         };
 
         let engine_cmd = config_file.resolve_engine(config.engine.as_deref());

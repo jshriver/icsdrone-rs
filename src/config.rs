@@ -213,6 +213,20 @@ impl ConfigFile {
             .unwrap_or_else(|| "stockfish".to_string())
     }
 
+    /// Path to the configured Polyglot opening book, or `None` if no
+    /// book should be used. Treats `Book` being absent from
+    /// config.json *and* `Book` being present but blank (`""` or
+    /// whitespace-only - e.g. a template config that left the field
+    /// empty rather than removing it) the same way: no book. A
+    /// non-blank path is returned as-is and is not checked for
+    /// existence here - that happens (and is an error if it fails)
+    /// when the caller actually tries to load it.
+    pub fn resolve_book_path(&self) -> Option<&Path> {
+        self.book.as_deref().filter(|p| {
+            p.to_str().map(|s| !s.trim().is_empty()).unwrap_or(true)
+        })
+    }
+
     /// Whether to whisper search stats after each move: `Kibitz` from
     /// config.json, flattened case-/whitespace-insensitively to
     /// Yes/No ("yes", "YES", " yEs " etc. all count as "Yes"; anything
@@ -282,6 +296,44 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(cfg.book.is_none());
+        assert!(cfg.resolve_book_path().is_none());
+    }
+
+    #[test]
+    fn resolve_book_path_treats_blank_book_as_none() {
+        // A template config.json that left "Book" present but empty
+        // (or whitespace-only) shouldn't be treated as "load a book
+        // from an empty path" - that should behave exactly like the
+        // key being absent entirely.
+        for blank in ["", "   ", "\t"] {
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!(
+                "icsdrone-test-blankbook-{}-{}.json",
+                std::process::id(),
+                blank.len()
+            ));
+            std::fs::write(&path, format!(r#"{{"Book": "{blank}"}}"#)).unwrap();
+
+            let cfg = ConfigFile::load(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+
+            assert!(
+                cfg.resolve_book_path().is_none(),
+                "blank Book value {blank:?} should resolve to no book"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_book_path_returns_configured_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("icsdrone-test-realbook-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"Book": "file.bin"}"#).unwrap();
+
+        let cfg = ConfigFile::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.resolve_book_path(), Some(Path::new("file.bin")));
     }
 
     #[test]
@@ -373,4 +425,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-
