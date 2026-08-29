@@ -34,6 +34,14 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive_ext: tar.gz
+          # Native arm64 Linux runner (e.g. for Raspberry Pi / Ampere
+          # servers) - no cross-compiling needed, this builds on real
+          # aarch64 hardware. GitHub-hosted arm64 runners are currently
+          # free in public repos only; on a private repo this label
+          # fails unless your plan includes private-repo arm64 runners.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             archive_ext: tar.gz
@@ -42,6 +50,14 @@ jobs:
             archive_ext: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            archive_ext: zip
+          # Native Windows arm64 runner (e.g. Copilot+ PCs / Windows on
+          # Arm devices). Same public-repo-only limitation as the Linux
+          # arm64 runner above; also currently in public preview rather
+          # than fully GA, so treat this leg as slightly less battle-
+          # tested than the others if it ever needs debugging.
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
             archive_ext: zip
 
     steps:
