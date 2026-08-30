@@ -5,6 +5,7 @@
   "Password": "yourpass",
   "Engine": "./yourengine",
   "Kibitz": "Yes",
+  "ColorBoard": "Yes",
   "engine_options": {
     "Hash": "1024",
     "Threads": "4",

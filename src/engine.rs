@@ -170,8 +170,8 @@ impl UciEngine {
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stdout = BufReader::new(stdout);
 
-        // Engines occasionally write diagnostics to stderr (e.g.
-        // Stockfish logging tablebase loading). Previously this was
+        // Engines occasionally write diagnostics to stderr (e.g. the
+        // engine logging tablebase loading). Previously this was
         // Stdio::inherit()'d straight to the terminal, which meant raw,
         // unlabeled, untimestamped text could show up interleaved with
         // the interactive prompt and everything else. Route it through
@@ -256,7 +256,7 @@ impl UciEngine {
         let trimmed = buf.trim_end();
         debug!("<- engine: {}", trimmed);
         // "info string" is the UCI channel engines use for one-off
-        // human-readable diagnostics (e.g. Stockfish's "Loaded N Syzygy
+        // human-readable diagnostics (e.g. the engine's "Loaded N Syzygy
         // file(s)..."), as opposed to "info depth ... score ... pv ..."
         // search progress, which fires many times per second and would
         // flood the console if surfaced the same way. Show only the

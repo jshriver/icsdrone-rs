@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 const DEFAULT_ICS_HOST: &str = "nightmare-chess.nl";
 /// Default ICS port, used when `Port` is absent from config.json.
 const DEFAULT_ICS_PORT: u16 = 5000;
+/// Default UCI engine command, used when neither `--engine` on the
+/// command line nor `Engine` in config.json is set.
+const DEFAULT_ENGINE_COMMAND: &str = "engine";
 
 /// icsdrone-rs: bridges an Internet Chess Server (ICS, e.g. FICS) to a
 /// UCI chess engine. Rust rewrite of icsdroneng, using UCI instead of
@@ -18,10 +21,10 @@ const DEFAULT_ICS_PORT: u16 = 5000;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "icsdrone-rs", version, about)]
 pub struct Config {
-    /// Command line used to launch the UCI engine, e.g. "stockfish" or
+    /// Command line used to launch the UCI engine, e.g. "engine" or
     /// "/path/to/engine --some-flag". Overrides `Engine` in config.json
     /// if both are set; falls back to `Engine` from config.json, then
-    /// to "stockfish", if omitted.
+    /// to "engine", if omitted.
     #[arg(long)]
     pub engine: Option<String>,
 
@@ -49,10 +52,12 @@ pub struct Config {
 
 /// Whether to announce search stats after each move as
 /// "depth=<d> score=<pawns> time=<s> node=<n> nps=<n> pv=<moves>"
-/// via ICS "whisper" (visible only to observers of the game).
-/// Controlled entirely by `Kibitz` in config.json (Yes/No) - there is
-/// deliberately no way to broadcast to the whole channel/room, only
-/// on/off. Whisper on by default.
+/// via ICS "whisper" (visible only to observers of the game) and on
+/// our own console (visible to the operator running the bot, even if
+/// they aren't separately observing the game). Controlled entirely by
+/// `Kibitz` in config.json (Yes/No) - there is deliberately no way to
+/// broadcast to the whole channel/room, only on/off. Whisper on by
+/// default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KibitzMode {
     /// Don't announce anything.
@@ -95,8 +100,9 @@ impl KibitzMode {
 ///   "Port": 5000,
 ///   "Username": "myhandle",
 ///   "Password": "mypassword",
-///   "Engine": "stockfish",
+///   "Engine": "engine",
 ///   "Kibitz": "Yes",
+///   "ColorBoard": "Yes",
 ///   "engine_options": {
 ///     "Hash": "1024",
 ///     "Threads": "4",
@@ -114,12 +120,16 @@ impl KibitzMode {
 /// `Engine` is the command line used to launch the UCI engine, same
 /// idea as `--engine` on the command line. `--engine`, if given, takes
 /// precedence over `Engine` here; if neither is set, it falls back to
-/// "stockfish" - see `resolve_engine`.
+/// "engine" - see `resolve_engine`.
 ///
 /// `Kibitz` turns search-stat announcements (via ICS "whisper", never
 /// the public "kibitz" channel) on or off. Accepts "Yes"/"No" in any
 /// case or spacing ("yes", "YES", " yEs " all mean on); defaults to
 /// "Yes" (whisper on) if absent - see `resolve_kibitz`.
+///
+/// `ColorBoard` turns ANSI move-highlighting on the console board on
+/// or off. Same "Yes"/"No" parsing as `Kibitz`; defaults to "Yes"
+/// (colored) if absent - see `resolve_color_board`.
 ///
 /// Keys/values in `engine_options` are sent to the engine as-is, so
 /// any option the engine supports can be set this way, not just
@@ -149,6 +159,15 @@ pub struct ConfigFile {
     #[serde(default, rename = "Kibitz")]
     pub kibitz: Option<String>,
 
+    /// Whether the console board (`to_board_string` via `println!` in
+    /// `app.rs`) is drawn with ANSI colors highlighting the previous
+    /// move's from/to squares, or left as the plain uncolored board.
+    /// Accepts "Yes"/"No" in any case or spacing, same as `Kibitz`;
+    /// defaults to "Yes" (colored) if absent - see
+    /// `resolve_color_board`.
+    #[serde(default, rename = "ColorBoard")]
+    pub color_board: Option<String>,
+
     #[serde(default)]
     pub engine_options: BTreeMap<String, String>,
 
@@ -159,12 +178,26 @@ pub struct ConfigFile {
 impl ConfigFile {
     /// Load from `path`. A missing file is not an error - it just means
     /// every field falls back to its default - but a file that exists
-    /// and fails to parse is.
+    /// and fails to parse is. Either way, logs which happened: a
+    /// missing config file and a present-but-typo'd filename both
+    /// silently fall back to defaults otherwise, which is confusing to
+    /// debug (e.g. seeing a guest login and a default engine command
+    /// with no indication config.json was never read at all).
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str(&contents)
-                .with_context(|| format!("failed to parse {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ConfigFile::default()),
+            Ok(contents) => {
+                let cfg = serde_json::from_str(&contents)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                tracing::info!("Loaded config from {}", path.display());
+                Ok(cfg)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    "Config file {} not found - using defaults (guest login, default engine)",
+                    path.display()
+                );
+                Ok(ConfigFile::default())
+            }
             Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
         }
     }
@@ -205,12 +238,13 @@ impl ConfigFile {
 
     /// Command line used to launch the UCI engine: `--engine` on the
     /// command line if given (it always wins, even over `Engine` in
-    /// config.json), else `Engine` from config.json, else "stockfish".
+    /// config.json), else `Engine` from config.json, else
+    /// `DEFAULT_ENGINE_COMMAND`.
     pub fn resolve_engine(&self, cli_engine: Option<&str>) -> String {
         cli_engine
             .map(str::to_string)
             .or_else(|| self.engine.clone())
-            .unwrap_or_else(|| "stockfish".to_string())
+            .unwrap_or_else(|| DEFAULT_ENGINE_COMMAND.to_string())
     }
 
     /// Path to the configured Polyglot opening book, or `None` if no
@@ -236,6 +270,22 @@ impl ConfigFile {
         match &self.kibitz {
             Some(s) => KibitzMode::from_str_flatten(s),
             None => KibitzMode::default(),
+        }
+    }
+
+    /// Whether to draw the console board with ANSI move highlighting:
+    /// `ColorBoard` from config.json, case-/whitespace-insensitively
+    /// flattened to Yes/No. Defaults to "Yes" (colored) if
+    /// `ColorBoard` is absent entirely. Unlike `Kibitz` (where an
+    /// unrecognized value falls back to the quieter "No"), an
+    /// unrecognized `ColorBoard` value falls back to the default
+    /// "Yes" - the display is purely cosmetic, so there's no safety
+    /// reason to prefer the plain board, and only an explicit "No"
+    /// should turn coloring off.
+    pub fn resolve_color_board(&self) -> bool {
+        match &self.color_board {
+            Some(s) => !s.trim().eq_ignore_ascii_case("no"),
+            None => true,
         }
     }
 }
@@ -377,9 +427,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_engine_defaults_to_stockfish() {
+    fn resolve_engine_defaults_to_default_engine_command() {
         let cfg = ConfigFile::default();
-        assert_eq!(cfg.resolve_engine(None), "stockfish");
+        assert_eq!(cfg.resolve_engine(None), DEFAULT_ENGINE_COMMAND);
     }
 
     #[test]
@@ -414,6 +464,51 @@ mod tests {
     }
 
     #[test]
+    fn resolve_color_board_defaults_to_yes_when_absent() {
+        let cfg = ConfigFile::default();
+        assert!(cfg.resolve_color_board());
+    }
+
+    #[test]
+    fn resolve_color_board_flattens_no_variants() {
+        for s in ["No", "no", "NO", "nO", " No ", "no\n"] {
+            let mut cfg = ConfigFile::default();
+            cfg.color_board = Some(s.to_string());
+            assert!(!cfg.resolve_color_board(), "input was {s:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_color_board_flattens_yes_variants() {
+        for s in ["Yes", "yes", "YES", "yEs", " Yes "] {
+            let mut cfg = ConfigFile::default();
+            cfg.color_board = Some(s.to_string());
+            assert!(cfg.resolve_color_board(), "input was {s:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_color_board_treats_garbage_as_yes() {
+        // Unlike Kibitz, an unrecognized ColorBoard value should keep
+        // the (colored) default rather than silently turning it off.
+        let mut cfg = ConfigFile::default();
+        cfg.color_board = Some("banana".to_string());
+        assert!(cfg.resolve_color_board());
+    }
+
+    #[test]
+    fn parses_color_board_field() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("icsdrone-test-colorboard-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"ColorBoard": "No"}"#).unwrap();
+
+        let cfg = ConfigFile::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!cfg.resolve_color_board());
+    }
+
+    #[test]
     fn malformed_config_file_is_an_error() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("icsdrone-test-bad-{}.json", std::process::id()));
@@ -425,3 +520,4 @@ mod tests {
         assert!(result.is_err());
     }
 }
+

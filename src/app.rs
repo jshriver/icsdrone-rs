@@ -29,6 +29,11 @@ pub struct App {
     /// fics.c's ProcessMatch.
     pending_challenger: Option<String>,
     kibitz_mode: KibitzMode,
+    /// Whether the console board is ANSI-colored (highlighting the
+    /// previous move's from/to squares) or plain. `ColorBoard` in
+    /// config.json, default Yes - see
+    /// `ConfigFile::resolve_color_board`.
+    color_board: bool,
 }
 
 impl App {
@@ -99,6 +104,7 @@ impl App {
             we_are_white: None,
             pending_challenger: None,
             kibitz_mode: config_file.resolve_kibitz(),
+            color_board: config_file.resolve_color_board(),
         })
     }
 
@@ -244,6 +250,13 @@ impl App {
             _ => return Ok(()), // not a game we're actively playing
         }
 
+        // Every style12 line for a game we're playing describes the
+        // board right after a ply was made - by us or by the opponent,
+        // whichever relation above matched. Show it to the operator
+        // either way, so they can follow the game locally without
+        // needing a separate ICS client observing it.
+        println!("{}", board.to_board_string(self.color_board));
+
         // Detect a new game (game number changed) and reset our tracking.
         if self.game_number != Some(board.game_number) {
             info!(
@@ -299,9 +312,15 @@ impl App {
         // mirrors what a human kibitzing their own analysis would post,
         // e.g. "depth=17 score=1.87 time=8.96 node=17234760
         // nps=1923522 pv=O-O g3 Re8 ...". Sent *before* the move itself
-        // so observers see the reasoning land right alongside it.
+        // so observers see the reasoning land right alongside it. Also
+        // echoed to our own console: the ICS whisper is only visible to
+        // observers of the game, so without this the operator running
+        // the bot would never see it unless they were also observing
+        // from a separate ICS client.
         if let (Some(cmd), Some(info)) = (self.kibitz_mode.ics_command(), result.info.as_ref()) {
-            self.ics.send(&format!("{cmd} {}", info.format_kibitz())).await?;
+            let stats = info.format_kibitz();
+            println!("[kibitz] {stats}");
+            self.ics.send(&format!("{cmd} {stats}")).await?;
         }
 
         self.ics.send(&result.bestmove).await?;
