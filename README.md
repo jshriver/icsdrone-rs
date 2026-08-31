@@ -15,6 +15,18 @@ ICS connection details (host, port, username, password) come from
 Leave `Password` unset (in config.json, and in `FICSPASSWD`/`ICSPASSWD`)
 to log in as a guest.
 
+### Command-line flags
+
+All optional — every one has a default or falls back to config.json:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--engine <cmd>` | (none) | Command line used to launch the UCI engine, e.g. `"engine"` or `"/path/to/engine --some-flag"`. Always wins over `Engine` in config.json if both are set; if neither is set, falls back to `"engine"`. |
+| `--config <path>` | `config.json` | Path to the JSON config file (see "Config file" below). A missing file is fine (defaults/guest login apply); a malformed one is an error. |
+| `--log-level <level>` | `info` | `error`, `warn`, `info`, `debug`, or `trace`. Logs go to stderr so they don't interleave with the interactive `>` prompt's output on stdout. |
+| `--base-minutes <n>` | `5` | Base time in minutes for the match clock — used only for icsdrone-rs's own bookkeeping/time management, not sent to the ICS at login. |
+| `--increment-seconds <n>` | `0` | Increment in seconds, same bookkeeping-only purpose as `--base-minutes`. |
+
 ### Interactive prompt
 
 Once running, a `>` prompt reads commands from stdin:
@@ -45,29 +57,75 @@ and an optional opening book:
   "Password": "yourpass",
   "Engine": "./yourengine",
   "Kibitz": "Yes",
+  "ColorBoard": "Yes",
+  "DisplayBoard": "True",
   "engine_options": {
     "Hash": "1024",
     "Threads": "4",
-    "SyzygyPath": "/path/to/syzygy"
+    "SyzygyPath": "/path/to/syzygy",
+    "Ponder": "false",
+    "OwnBook": "false",
+    "NNUE": "true"
   },
   "Book": "file.bin"
 }
 ```
 
 - `Host`/`Port` default to `nightmare-chess.nl`/`5000` if omitted.
+- `Username`: ICS handle to log in as. Falls back to `$FICSHANDLE`,
+  then `$ICSHANDLE`, then `"guest"` if omitted.
+- `Password`: ICS password for `Username`. Falls back to
+  `$FICSPASSWD`, then `$ICSPASSWD`. Leave it unset everywhere (here
+  and both env vars) to log in as a guest.
 - `Engine`: command line used to launch the UCI engine, same idea as
   `--engine` on the command line. `--engine`, if given, always takes
   precedence over `Engine` here; if neither is set, it falls back to
-  `stockfish`.
+  the literal command `engine` (i.e. an executable named `engine` on
+  `$PATH`).
 - `Kibitz`: `"Yes"` or `"No"` (case/whitespace insensitive), whether to
   whisper search stats after each move - see "Kibitzing search stats"
   below. Defaults to `"Yes"` if omitted.
+- `ColorBoard`: `"Yes"` or `"No"` (case/whitespace insensitive),
+  whether the console board is ANSI-colored (highlighting the previous
+  move's from/to squares). Defaults to `"Yes"` if omitted. This also
+  gates whether the screen-clearing escape below is sent at all: `"No"`
+  means "this terminal can't handle ANSI, period", not just the
+  highlighting, so with `"No"` the console gets a plain redraw with no
+  escape codes whatsoever - useful for a dumb terminal or when
+  redirecting output to a file/log.
+- `DisplayBoard`: `"True"` or `"False"` (case/whitespace insensitive,
+  same as `ColorBoard`/`Kibitz`). When `"False"`, the console board is
+  never printed at all. Defaults to `"True"` if omitted. When the
+  board is displayed and `ColorBoard` is `"Yes"`, the screen is
+  cleared (via an ANSI escape) right before each redraw, so the latest
+  position replaces the previous one instead of scrolling.
+  Just above the board, a short header is printed:
+  ```
+  Opponent: SomeHandle
+  Move: P/e2-e4
+  Kibitz: depth=17 score=1.87 time=8.96 node=17234760 nps=1923522 pv=...
+  ```
+  `Opponent` and `Move` come from the current game's style12 line;
+  `Kibitz` is the most recent search-stats line from our own last
+  move (see "Kibitzing search stats" below) and is only shown once
+  we've made at least one move in the game - it's carried over from
+  the previous board redraw and cleared at the start of each new
+  game.
 - `engine_options`: any option name the engine supports works here,
-  not just Hash/Threads/SyzygyPath.
-- `Book`: path to a Polyglot (`.bin`) opening book. When set, it's
-  checked for a move before the engine is asked to search each turn;
-  once the game falls out of book, every move for the rest of that
-  game goes through the engine as usual.
+  not just Hash/Threads/SyzygyPath - sent to the engine as-is via
+  `setoption name <k> value <v>`. `Ponder`, `OwnBook`, and `NNUE` are
+  UCI "check" (boolean) options like any other, just with built-in
+  defaults (`Ponder`/`OwnBook` default to `"false"`, `NNUE` defaults
+  to `"true"`) applied when that key isn't listed here at all, so you
+  don't have to spell them out unless you want a non-default value.
+- `Book`: path (absolute, or relative to the working directory the
+  process was started from) to a Polyglot (`.bin`) opening book. When
+  set, it's checked for a move before the engine is asked to search
+  each turn; once the position falls out of book, every move for the
+  rest of that game goes through the engine as usual. Omitting `Book`
+  entirely, or leaving it present but blank/whitespace-only (e.g. a
+  template config that left the field empty rather than deleting it),
+  are both treated the same way: no book.
 
 A missing config file is fine (every field falls back to its
 default/guest login); a malformed one is an error.

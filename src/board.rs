@@ -388,8 +388,7 @@ mod tests {
     fn renders_ascii_board_for_start_position() {
         let line = "<12> rnbqkbnr pppppppp -------- -------- -------- -------- PPPPPPPP RNBQKBNR W -1 1 1 1 1 0 39 GuestABCD GuestEFGH -1 5 0 39 39 300 300 1 none (0:00) none 0 0 0";
         let s12 = Style12::parse(line).unwrap();
-        let expected = "\
-   +---+---+---+---+---+---+---+---+
+        let expected = "   +---+---+---+---+---+---+---+---+
  8 | r | n | b | q | k | b | n | r |
    +---+---+---+---+---+---+---+---+
  7 | p | p | p | p | p | p | p | p |

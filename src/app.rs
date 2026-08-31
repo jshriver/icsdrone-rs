@@ -34,6 +34,16 @@ pub struct App {
     /// config.json, default Yes - see
     /// `ConfigFile::resolve_color_board`.
     color_board: bool,
+    /// Whether the console board is displayed at all. `DisplayBoard`
+    /// in config.json, default `true` - see
+    /// `ConfigFile::resolve_display_board`.
+    display_board: bool,
+    /// Search-stats line from the most recent kibitz/whisper (see
+    /// `format_kibitz`), shown under the board on the following
+    /// redraw so the operator can see it without scrolling back.
+    /// Reset to `None` at the start of each new game (`reset_game`) -
+    /// there's no "last move" to have kibitzed about yet.
+    last_kibitz: Option<String>,
 }
 
 impl App {
@@ -80,6 +90,10 @@ impl App {
             );
         }
 
+        // Ponder/OwnBook/NNUE (default false/false/true) plus whatever
+        // was listed explicitly under engine_options.
+        let engine_options = config_file.resolve_engine_options();
+
         let book = match config_file.resolve_book_path() {
             Some(path) => {
                 info!("Loading opening book: {}", path.display());
@@ -93,7 +107,7 @@ impl App {
 
         let engine_cmd = config_file.resolve_engine(config.engine.as_deref());
         info!("Spawning engine: {}", engine_cmd);
-        let engine = UciEngine::spawn(&engine_cmd, &config_file.engine_options).await?;
+        let engine = UciEngine::spawn(&engine_cmd, &engine_options).await?;
 
         Ok(App {
             ics,
@@ -105,6 +119,8 @@ impl App {
             pending_challenger: None,
             kibitz_mode: config_file.resolve_kibitz(),
             color_board: config_file.resolve_color_board(),
+            display_board: config_file.resolve_display_board(),
+            last_kibitz: None,
         })
     }
 
@@ -234,6 +250,25 @@ impl App {
     fn reset_game(&mut self) {
         self.game_number = None;
         self.we_are_white = None;
+        self.last_kibitz = None;
+    }
+
+    /// Combines the `Opponent`/`Move`/`Kibitz` header with the board
+    /// render into what actually gets printed, prefixed with an ANSI
+    /// "clear screen, cursor home" escape only when `ansi_ok` is true.
+    /// Callers pass `self.color_board` for `ansi_ok`: if a terminal
+    /// can't handle the square-highlighting escapes `to_board_string`
+    /// emits (that's what `ColorBoard: "No"` is for), it can't handle
+    /// *any* ANSI escape sequence, clear-screen included - so
+    /// `ColorBoard: "No"` needs to suppress this prefix too, not just
+    /// the highlighting, or the console never actually becomes free of
+    /// ANSI codes.
+    fn board_frame(header: &str, board_str: &str, ansi_ok: bool) -> String {
+        if ansi_ok {
+            format!("\x1B[2J\x1B[1;1H{header}\n\n{board_str}")
+        } else {
+            format!("{header}\n\n{board_str}")
+        }
     }
 
     async fn handle_style12(&mut self, line: &str) -> Result<()> {
@@ -250,14 +285,10 @@ impl App {
             _ => return Ok(()), // not a game we're actively playing
         }
 
-        // Every style12 line for a game we're playing describes the
-        // board right after a ply was made - by us or by the opponent,
-        // whichever relation above matched. Show it to the operator
-        // either way, so they can follow the game locally without
-        // needing a separate ICS client observing it.
-        println!("{}", board.to_board_string(self.color_board));
-
-        // Detect a new game (game number changed) and reset our tracking.
+        // Detect a new game (game number changed) and reset our
+        // tracking - before the board print below, so a fresh game's
+        // first board doesn't show a stale kibitz line left over from
+        // the previous game.
         if self.game_number != Some(board.game_number) {
             info!(
                 "New game #{}: {} (white) vs {} (black)",
@@ -265,6 +296,33 @@ impl App {
             );
             self.game_number = Some(board.game_number);
             self.we_are_white = Some(board.white_name == self.handle);
+            self.last_kibitz = None;
+        }
+
+        // Every style12 line for a game we're playing describes the
+        // board right after a ply was made - by us or by the opponent,
+        // whichever relation above matched. Show it to the operator
+        // either way, so they can follow the game locally without
+        // needing a separate ICS client observing it - unless
+        // `DisplayBoard` turned board display off entirely.
+        if self.display_board {
+            // Whichever of White/Black isn't us. Compared against
+            // `board.white_name`/`black_name` directly (not
+            // `self.we_are_white`) so this is correct even on the very
+            // first style12 line of a game.
+            let opponent = if board.white_name == self.handle {
+                &board.black_name
+            } else {
+                &board.white_name
+            };
+
+            let mut header = format!("Opponent: {opponent}\nMove: {}", board.last_move_verbose);
+            if let Some(kibitz) = &self.last_kibitz {
+                header.push_str(&format!("\nKibitz: {kibitz}"));
+            }
+
+            let board_str = board.to_board_string(self.color_board);
+            println!("{}", Self::board_frame(&header, &board_str, self.color_board));
         }
 
         if !matches!(board.relation, Relation::PlayingMyMove) {
@@ -316,11 +374,17 @@ impl App {
         // echoed to our own console: the ICS whisper is only visible to
         // observers of the game, so without this the operator running
         // the bot would never see it unless they were also observing
-        // from a separate ICS client.
-        if let (Some(cmd), Some(info)) = (self.kibitz_mode.ics_command(), result.info.as_ref()) {
+        // from a separate ICS client. `last_kibitz` is remembered
+        // (regardless of `Kibitz`/whisper being on) so the next board
+        // redraw's "Kibitz:" header line has it even if whispering to
+        // ICS is turned off.
+        if let Some(info) = result.info.as_ref() {
             let stats = info.format_kibitz();
-            println!("[kibitz] {stats}");
-            self.ics.send(&format!("{cmd} {stats}")).await?;
+            self.last_kibitz = Some(stats.clone());
+            if let Some(cmd) = self.kibitz_mode.ics_command() {
+                println!("[kibitz] {stats}");
+                self.ics.send(&format!("{cmd} {stats}")).await?;
+            }
         }
 
         self.ics.send(&result.bestmove).await?;
@@ -461,6 +525,23 @@ fn is_game_over_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_frame_prefixes_clear_screen_when_ansi_ok() {
+        let frame = App::board_frame("Opponent: bob", "  +---+", true);
+        assert_eq!(frame, "\x1B[2J\x1B[1;1HOpponent: bob\n\n  +---+");
+    }
+
+    #[test]
+    fn board_frame_omits_clear_screen_when_ansi_not_ok() {
+        // ColorBoard: "No" means the terminal can't handle ANSI at
+        // all, not just the square-highlighting codes - so the
+        // clear-screen escape must be left out too, or the console
+        // never actually becomes free of ANSI codes.
+        let frame = App::board_frame("Opponent: bob", "  +---+", false);
+        assert_eq!(frame, "Opponent: bob\n\n  +---+");
+        assert!(!frame.contains('\x1B'));
+    }
 
     #[test]
     fn detects_checkmate() {

@@ -6,10 +6,14 @@
   "Engine": "./yourengine",
   "Kibitz": "Yes",
   "ColorBoard": "Yes",
+  "DisplayBoard": "True",
   "engine_options": {
     "Hash": "1024",
     "Threads": "4",
-    "SyzygyPath": "/path/to/syzygy"
+    "SyzygyPath": "/path/to/syzygy",
+    "Ponder": "false",
+    "OwnBook": "false",
+    "NNUE": "true"
   },
   "Book": "file.bin"
 }

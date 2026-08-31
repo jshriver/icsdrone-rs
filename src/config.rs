@@ -103,10 +103,14 @@ impl KibitzMode {
 ///   "Engine": "engine",
 ///   "Kibitz": "Yes",
 ///   "ColorBoard": "Yes",
+///   "DisplayBoard": "True",
 ///   "engine_options": {
 ///     "Hash": "1024",
 ///     "Threads": "4",
-///     "SyzygyPath": "/path/to/syzygy"
+///     "SyzygyPath": "/path/to/syzygy",
+///     "Ponder": "false",
+///     "OwnBook": "false",
+///     "NNUE": "true"
 ///   },
 ///   "Book": "file.bin"
 /// }
@@ -131,9 +135,20 @@ impl KibitzMode {
 /// or off. Same "Yes"/"No" parsing as `Kibitz`; defaults to "Yes"
 /// (colored) if absent - see `resolve_color_board`.
 ///
-/// Keys/values in `engine_options` are sent to the engine as-is, so
-/// any option the engine supports can be set this way, not just
-/// Hash/Threads/SyzygyPath.
+/// `DisplayBoard` turns the console board display itself on or off -
+/// when "False", the board is never printed at all, regardless of
+/// `ColorBoard`. Accepts "True"/"False" in any case or spacing;
+/// defaults to "True" if absent - see `resolve_display_board`.
+///
+/// Keys/values in `engine_options` are sent to the engine as-is via
+/// `setoption name <k> value <v>`, so any option the engine supports
+/// can be set this way, not just Hash/Threads/SyzygyPath. `Ponder`,
+/// `OwnBook`, and `NNUE` are UCI "check" (boolean) options like any
+/// other - they just come with built-in defaults (`"false"`,
+/// `"false"`, and `"true"` respectively) applied when the key isn't
+/// present under `engine_options` at all, so they don't need to be
+/// listed explicitly for the common case - see
+/// `resolve_engine_options`.
 ///
 /// `Book` is a path (absolute, or relative to the current working
 /// directory) to a Polyglot (`.bin`) opening book. When set, it's
@@ -167,6 +182,16 @@ pub struct ConfigFile {
     /// `resolve_color_board`.
     #[serde(default, rename = "ColorBoard")]
     pub color_board: Option<String>,
+
+    /// Whether the console board is displayed at all. Unlike
+    /// `ColorBoard` (which only controls styling), setting this to
+    /// `"False"` suppresses the board output entirely. Accepts
+    /// "True"/"False" in any case or spacing, same parsing as
+    /// `ColorBoard`/`Kibitz`; defaults to "True" (display it, as
+    /// before this option existed) if absent - see
+    /// `resolve_display_board`.
+    #[serde(default, rename = "DisplayBoard")]
+    pub display_board: Option<String>,
 
     #[serde(default)]
     pub engine_options: BTreeMap<String, String>,
@@ -288,6 +313,38 @@ impl ConfigFile {
             None => true,
         }
     }
+
+    /// Whether to display the console board at all: `DisplayBoard`
+    /// from config.json, defaulting to "True" (display it, matching
+    /// behavior before this option existed) if absent. Same
+    /// "unrecognized value falls back to the default" reasoning as
+    /// `resolve_color_board` above - only an explicit "False" should
+    /// turn the board off.
+    pub fn resolve_display_board(&self) -> bool {
+        match &self.display_board {
+            Some(s) => !s.trim().eq_ignore_ascii_case("false"),
+            None => true,
+        }
+    }
+
+    /// The full set of UCI options to send to the engine at startup:
+    /// `engine_options` from config.json, with `Ponder`, `OwnBook`,
+    /// and `NNUE` (UCI "check"/boolean options) defaulted to
+    /// `"false"`, `"false"`, and `"true"` respectively for any of
+    /// those three keys not already present - so they don't have to
+    /// be listed explicitly for the common case, but an explicit
+    /// `"Ponder": "false"` (etc.) under `engine_options` always wins
+    /// over the default.
+    pub fn resolve_engine_options(&self) -> BTreeMap<String, String> {
+        let mut opts = self.engine_options.clone();
+        opts.entry("Ponder".to_string())
+            .or_insert_with(|| "false".to_string());
+        opts.entry("OwnBook".to_string())
+            .or_insert_with(|| "false".to_string());
+        opts.entry("NNUE".to_string())
+            .or_insert_with(|| "true".to_string());
+        opts
+    }
 }
 
 #[cfg(test)]
@@ -362,7 +419,15 @@ mod tests {
                 std::process::id(),
                 blank.len()
             ));
-            std::fs::write(&path, format!(r#"{{"Book": "{blank}"}}"#)).unwrap();
+            // Build the JSON via serde_json rather than interpolating
+            // `blank` straight into a format! string: the "\t" case is
+            // a literal tab character, and an unescaped control
+            // character inside a JSON string is invalid JSON (it must
+            // be written as the two characters `\t`) - serde_json's
+            // serializer escapes it correctly, a hand-written format!
+            // string does not.
+            let json = serde_json::json!({ "Book": blank }).to_string();
+            std::fs::write(&path, json).unwrap();
 
             let cfg = ConfigFile::load(&path).unwrap();
             std::fs::remove_file(&path).ok();
@@ -506,6 +571,101 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(!cfg.resolve_color_board());
+    }
+
+    #[test]
+    fn resolve_display_board_defaults_to_true_when_absent() {
+        let cfg = ConfigFile::default();
+        assert!(cfg.resolve_display_board());
+    }
+
+    #[test]
+    fn resolve_display_board_flattens_false_variants() {
+        for s in ["False", "false", "FALSE", "fAlSe", " False "] {
+            let mut cfg = ConfigFile::default();
+            cfg.display_board = Some(s.to_string());
+            assert!(!cfg.resolve_display_board(), "input was {s:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_display_board_flattens_true_variants() {
+        for s in ["True", "true", "TRUE", "tRuE", " True "] {
+            let mut cfg = ConfigFile::default();
+            cfg.display_board = Some(s.to_string());
+            assert!(cfg.resolve_display_board(), "input was {s:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_display_board_treats_garbage_as_true() {
+        // Same reasoning as ColorBoard: an unrecognized DisplayBoard
+        // value should keep the (displayed) default rather than
+        // silently turning the board off.
+        let mut cfg = ConfigFile::default();
+        cfg.display_board = Some("banana".to_string());
+        assert!(cfg.resolve_display_board());
+    }
+
+    #[test]
+    fn parses_display_board_field() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("icsdrone-test-displayboard-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"DisplayBoard": "False"}"#).unwrap();
+
+        let cfg = ConfigFile::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!cfg.resolve_display_board());
+    }
+
+    #[test]
+    fn resolve_engine_options_fills_in_defaults() {
+        let cfg = ConfigFile::default();
+        let opts = cfg.resolve_engine_options();
+        assert_eq!(opts.get("Ponder").map(String::as_str), Some("false"));
+        assert_eq!(opts.get("OwnBook").map(String::as_str), Some("false"));
+        assert_eq!(opts.get("NNUE").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn resolve_engine_options_explicit_engine_options_wins() {
+        // An explicit entry under `engine_options` for Ponder/OwnBook/
+        // NNUE overrides the built-in default for that key.
+        let mut cfg = ConfigFile::default();
+        cfg.engine_options
+            .insert("NNUE".to_string(), "false".to_string());
+        let opts = cfg.resolve_engine_options();
+        assert_eq!(opts.get("NNUE").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn resolve_engine_options_preserves_other_engine_options() {
+        let mut cfg = ConfigFile::default();
+        cfg.engine_options
+            .insert("Hash".to_string(), "1024".to_string());
+        let opts = cfg.resolve_engine_options();
+        assert_eq!(opts.get("Hash").map(String::as_str), Some("1024"));
+        assert_eq!(opts.get("Ponder").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn parses_ponder_own_book_nnue_from_engine_options() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("icsdrone-test-uciopts-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"engine_options": {"Ponder": "true", "OwnBook": "true", "NNUE": "false"}}"#,
+        )
+        .unwrap();
+
+        let cfg = ConfigFile::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let opts = cfg.resolve_engine_options();
+        assert_eq!(opts.get("Ponder").map(String::as_str), Some("true"));
+        assert_eq!(opts.get("OwnBook").map(String::as_str), Some("true"));
+        assert_eq!(opts.get("NNUE").map(String::as_str), Some("false"));
     }
 
     #[test]
