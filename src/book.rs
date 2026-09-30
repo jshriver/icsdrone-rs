@@ -70,6 +70,7 @@ fn normalize_castling(mv: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Hand-assembles a minimal Polyglot `.bin` book (the format is a
     /// flat array of big-endian 16-byte records: 8-byte position key,
@@ -79,10 +80,13 @@ mod tests {
     /// Square numbers follow the format's `rank*8+file` convention
     /// (a1=0 ... h1=7, a8=56 ... h8=63).
     fn write_test_book(entries: &[(u64, u8, u8, u16)]) -> std::path::PathBuf {
+        // Tests run in parallel within one process, so the pid alone
+        // isn't enough to keep each test's book file to itself.
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "icsdrone_test_book_{}_{}.bin",
             std::process::id(),
-            entries.len()
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let mut f = std::fs::File::create(&path).unwrap();
         for &(key, from_sq, to_sq, weight) in entries {

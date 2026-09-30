@@ -391,15 +391,21 @@ impl UciEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Writes a tiny scripted fake UCI engine (python3, since it's
     /// available in the test environment and easy to reason about line
     /// by line) that answers uci/isready/go/stop and logs every line it
     /// receives - in particular setoption - to `log_path` so the test
-    /// can assert on what was sent and in what order.
-    fn write_fake_engine() -> std::path::PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("icsdrone_fake_uci_engine_{}.py", std::process::id()));
+    /// can assert on what was sent and in what order. Returns the script
+    /// path and the log path, both unique per call: tests run in
+    /// parallel within one process, so the pid alone isn't enough to
+    /// keep each test's files to itself.
+    fn write_fake_engine() -> (std::path::PathBuf, std::path::PathBuf) {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = format!("{}_{}", std::process::id(), NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        let path = std::env::temp_dir().join(format!("icsdrone_fake_uci_engine_{id}.py"));
+        let log_path = std::env::temp_dir().join(format!("icsdrone_fake_uci_engine_log_{id}.txt"));
         let script = r#"#!/usr/bin/env python3
 import sys
 
@@ -425,7 +431,7 @@ for line in sys.stdin:
     sys.stdout.flush()
 "#;
         std::fs::write(&path, script).unwrap();
-        path
+        (path, log_path)
     }
 
     #[test]
@@ -493,9 +499,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn sends_configured_options_before_first_isready() {
-        let script_path = write_fake_engine();
-        let log_path = std::env::temp_dir()
-            .join(format!("icsdrone_fake_uci_engine_log_{}.txt", std::process::id()));
+        let (script_path, log_path) = write_fake_engine();
 
         let mut options = BTreeMap::new();
         options.insert("Hash".to_string(), "1024".to_string());
@@ -526,9 +530,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn stop_drains_a_bestmove_left_unread_on_the_pipe() {
-        let script_path = write_fake_engine();
-        let log_path = std::env::temp_dir()
-            .join(format!("icsdrone_fake_uci_engine_log_{}.txt", std::process::id()));
+        let (script_path, log_path) = write_fake_engine();
 
         let command_line = format!("python3 {} {}", script_path.display(), log_path.display());
         let mut engine = UciEngine::spawn(&command_line, &BTreeMap::new()).await.unwrap();

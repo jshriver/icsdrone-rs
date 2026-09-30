@@ -344,7 +344,7 @@ impl App {
         // search from here".
         if let Some(book_move) = self.book.as_ref().and_then(|b| b.best_move_from_fen(&fen)) {
             info!("Book move: {}", book_move);
-            self.ics.send(&book_move).await?;
+            self.ics.send(&to_ics_move(&book_move)).await?;
             return Ok(());
         }
 
@@ -387,7 +387,7 @@ impl App {
             }
         }
 
-        self.ics.send(&result.bestmove).await?;
+        self.ics.send(&to_ics_move(&result.bestmove)).await?;
 
         Ok(())
     }
@@ -494,6 +494,19 @@ fn is_quit_command(cmd: &str) -> bool {
     cmd.eq_ignore_ascii_case("quit") || cmd.eq_ignore_ascii_case("exit")
 }
 
+/// Convert a UCI/Polyglot coordinate move into the form the ICS accepts.
+/// Plain moves ("e2e4", and castling as "e1g1") are fine as-is, but a
+/// promotion's bare piece suffix ("a2a1q") isn't recognized as a move
+/// at all ("a2a1q: Command not found") - the ICS wants it as "a2a1=Q".
+fn to_ics_move(mv: &str) -> String {
+    match mv.as_bytes() {
+        [_, _, _, _, piece @ (b'q' | b'r' | b'b' | b'n')] => {
+            format!("{}={}", &mv[..4], piece.to_ascii_uppercase() as char)
+        }
+        _ => mv.to_string(),
+    }
+}
+
 /// Extract the challenger's handle from a line containing a "Challenge:
 /// ..." announcement, e.g. `"Challenge: jshriver (1738) [white] Erebus
 /// (1798) rated blitz 5 1."` -> `Some("jshriver")`. Looks for
@@ -525,6 +538,21 @@ fn is_game_over_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converts_promotions_to_ics_form() {
+        assert_eq!(to_ics_move("a2a1q"), "a2a1=Q");
+        assert_eq!(to_ics_move("e7e8n"), "e7e8=N");
+        assert_eq!(to_ics_move("b7a8r"), "b7a8=R");
+        assert_eq!(to_ics_move("h2g1b"), "h2g1=B");
+    }
+
+    #[test]
+    fn leaves_non_promotion_moves_unchanged() {
+        assert_eq!(to_ics_move("e2e4"), "e2e4");
+        assert_eq!(to_ics_move("e1g1"), "e1g1");
+        assert_eq!(to_ics_move("(none)"), "(none)");
+    }
 
     #[test]
     fn board_frame_prefixes_clear_screen_when_ansi_ok() {
