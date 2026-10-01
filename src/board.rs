@@ -60,7 +60,6 @@ pub struct Style12 {
     // feature yet). Kept for when those land, rather than dropped and
     // re-added later - #[allow(dead_code)] to keep `cargo build`
     // warning-free until then.
-    #[allow(dead_code)]
     pub initial_time_minutes: i32,
     pub increment_seconds: i32,
     #[allow(dead_code)]
@@ -74,6 +73,10 @@ pub struct Style12 {
     /// or "none" for the initial position.
     #[allow(dead_code)]
     pub last_move_verbose: String,
+    /// The previous move in algebraic notation, e.g. "Nf3", "Qxc4",
+    /// "O-O" (style12 field 28), or "none" for the initial position.
+    /// Used for the GUI's move list.
+    pub last_move_san: String,
     #[allow(dead_code)]
     pub board_flipped: bool,
 }
@@ -118,6 +121,7 @@ impl Style12 {
         let black_time_ms: i64 = fields[24].parse::<i64>().context("black_time")? * 1000;
         let next_move_number: u32 = fields[25].parse().context("next_move_number")?;
         let last_move_verbose = fields.get(26).unwrap_or(&"none").to_string();
+        let last_move_san = fields.get(28).unwrap_or(&"none").to_string();
         let board_flipped = fields.get(29).map(|s| *s == "1").unwrap_or(false);
 
         Ok(Style12 {
@@ -141,8 +145,16 @@ impl Style12 {
             black_time_ms,
             next_move_number,
             last_move_verbose,
+            last_move_san,
             board_flipped,
         })
+    }
+
+    /// The ply number of the move that led to this board (1 = White's
+    /// first move), or 0 for the starting position.
+    pub fn ply(&self) -> usize {
+        let full_moves = self.next_move_number.saturating_sub(1) as usize;
+        full_moves * 2 + usize::from(!self.to_move_white)
     }
 
     /// Convert to a FEN string (board + side to move + castling + en
@@ -309,7 +321,7 @@ impl Style12 {
 
     /// Best-effort (row, col) of the from/to squares of the previous
     /// move, indexed the same way as `self.rows` (row 0 = rank 8, col
-    /// 0 = file a), for highlighting in `to_ansi_board`.
+    /// 0 = file a), for highlighting in `to_ansi_board` and the GUI.
     ///
     /// `last_move_verbose` (style12 field 26) looks like "P/e2-e4",
     /// "N/g1-f3", "P/e7-e8=Q" (promotion), "P/d5-c6ep" (en passant),
@@ -317,7 +329,7 @@ impl Style12 {
     /// Only the "<piece>/<from>-<to>..." shape has recognizable
     /// square coordinates; castling and "none" fall through to `None`,
     /// which just means no highlight - the board still renders fine.
-    fn last_move_squares(&self) -> Option<((usize, usize), (usize, usize))> {
+    pub fn last_move_squares(&self) -> Option<((usize, usize), (usize, usize))> {
         // Piece prefix (e.g. "P/") is separated by '/'; take whatever
         // comes after the last one, or the whole string if there's no
         // '/' at all (e.g. "O-O", which parse_square will reject).
@@ -361,6 +373,17 @@ fn parse_square(tok: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_plies() {
+        let tail = |side: &str, mv: u32| {
+            format!("<12> rnbqkbnr pppppppp -------- -------- -------- -------- PPPPPPPP RNBQKBNR {side} -1 1 1 1 1 0 7 a b 1 1 0 39 39 60 60 {mv} none (0:00) none 0 0 0")
+        };
+        assert_eq!(Style12::parse(&tail("W", 1)).unwrap().ply(), 0);
+        assert_eq!(Style12::parse(&tail("B", 1)).unwrap().ply(), 1);
+        assert_eq!(Style12::parse(&tail("W", 2)).unwrap().ply(), 2);
+        assert_eq!(Style12::parse(&tail("B", 23)).unwrap().ply(), 45);
+    }
 
     #[test]
     fn parses_start_position() {

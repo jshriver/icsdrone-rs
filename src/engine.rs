@@ -123,12 +123,7 @@ impl EngineInfo {
     /// "info" line (nps, not "speed"), just with score in pawns and
     /// time in seconds for readability.
     pub fn format_kibitz(&self) -> String {
-        let score = match (self.score_mate, self.score_cp) {
-            (Some(m), _) if m >= 0 => format!("M{m}"),
-            (Some(m), _) => format!("-M{}", -m),
-            (None, Some(cp)) => format!("{:.2}", cp as f64 / 100.0),
-            (None, None) => "?".to_string(),
-        };
+        let score = self.score_string();
         let time_s = self.time_ms.unwrap_or(0) as f64 / 1000.0;
         format!(
             "depth={} score={} time={:.2} node={} nps={} pv={}",
@@ -139,6 +134,19 @@ impl EngineInfo {
             self.nps.unwrap_or(0),
             self.pv.as_deref().unwrap_or("")
         )
+    }
+}
+
+impl EngineInfo {
+    /// Score from the engine's point of view: pawns with two decimals
+    /// ("1.87"), mate in N as "M3"/"-M3", or "?" if none was sent.
+    pub fn score_string(&self) -> String {
+        match (self.score_mate, self.score_cp) {
+            (Some(m), _) if m >= 0 => format!("M{m}"),
+            (Some(m), _) => format!("-M{}", -m),
+            (None, Some(cp)) => format!("{:.2}", cp as f64 / 100.0),
+            (None, None) => "?".to_string(),
+        }
     }
 }
 

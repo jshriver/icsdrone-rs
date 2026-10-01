@@ -26,7 +26,13 @@ const DONT: u8 = 254;
 const TIMESEAL_KEY: &[u8] = b"Timestamp (FICS) v1.0 - programmed by Henrik Gram.";
 /// Keepalive the server embeds in its output for timeseal clients;
 /// it has to be stripped from the text and answered promptly.
+/// LaskerRevisited sends it NUL-terminated mid-stream; FICS sends it as
+/// a line of its own (`TIMESEAL_PING_LINE`).
 const TIMESEAL_PING: &[u8] = b"[G]\0";
+const TIMESEAL_PING_LINE: &str = "[G]";
+/// ASCII BEL. FICS rings it on moves and game starts; dropped so
+/// terminals don't beep and the GUI console doesn't show a box.
+const BELL: char = '\x07';
 const TIMESEAL_PONG: &[u8] = b"\x029";
 
 pub struct IcsConn {
@@ -156,11 +162,15 @@ impl IcsConn {
         if self.timeseal_start.is_some() {
             while let Some(pos) = find(&self.pending, TIMESEAL_PING) {
                 self.pending.drain(pos..pos + TIMESEAL_PING.len());
-                self.log_wire("->", b"<timeseal ping reply>\n");
-                self.write_lines(&with_newline_bytes(TIMESEAL_PONG)).await?;
+                self.answer_ping().await?;
             }
         }
         Ok(n)
+    }
+
+    async fn answer_ping(&mut self) -> Result<()> {
+        self.log_wire("->", b"<timeseal ping reply>\n");
+        self.write_lines(&with_newline_bytes(TIMESEAL_PONG)).await
     }
 
     /// Try to pull one complete line out of `pending`. Mirrors the
@@ -214,11 +224,17 @@ impl IcsConn {
     }
 
     /// Read one line from the server, waiting (async) until one is
-    /// available. Returns the line with terminator characters stripped.
+    /// available. Returns the line with terminator characters and bell
+    /// characters stripped; timeseal ping lines are answered and never
+    /// returned.
     pub async fn read_line(&mut self) -> Result<String> {
         loop {
             if let Some(line) = self.try_extract_line() {
-                return Ok(line);
+                if self.timeseal_start.is_some() && line.trim() == TIMESEAL_PING_LINE {
+                    self.answer_ping().await?;
+                    continue;
+                }
+                return Ok(line.replace(BELL, ""));
             }
             self.fill().await?;
         }

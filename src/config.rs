@@ -89,7 +89,9 @@ impl KibitzMode {
 ///   "Engine": "engine",
 ///   "Kibitz": "Yes",
 ///   "ColorBoard": "Yes",
+///   "GUI": "No",
 ///   "Timeseal": "Yes",
+///   "SavePGN": "games.pgn",
 ///   "engine_options": {
 ///     "Hash": "1024",
 ///     "Threads": "4",
@@ -120,11 +122,21 @@ impl KibitzMode {
 /// colored vs. plain ASCII. Same "Yes"/"No" parsing as `Kibitz`;
 /// defaults to "No" (plain) if absent - see `resolve_color_board`.
 ///
+/// `GUI` opens the desktop window (board, clocks, moves, engine stats,
+/// console). With it on, the terminal board isn't printed and
+/// `ColorBoard` is ignored; the terminal keeps showing server lines,
+/// kibitz and logs, and still takes commands. "Yes"/"No"; defaults to
+/// "No" - see `resolve_gui`.
+///
 /// `Timeseal` turns on timeseal v1 encoding of everything we send, so
 /// the server charges us for thinking time only, not network lag.
 /// "Yes"/"No" like `Kibitz`; defaults to "No", since a server without
 /// timeseal support would read the encoded lines as garbage - see
 /// `resolve_timeseal`.
+///
+/// `SavePGN` is a file every finished game we play is appended to, as
+/// PGN. Empty or absent means games aren't saved - see
+/// `resolve_save_pgn`.
 ///
 /// Keys/values in `engine_options` are sent to the engine as-is via
 /// `setoption name <k> value <v>`, so any option the engine supports
@@ -169,6 +181,14 @@ pub struct ConfigFile {
     #[serde(default, rename = "ColorBoard")]
     pub color_board: Option<String>,
 
+    /// Whether to open the desktop window - see `resolve_gui`.
+    #[serde(default, rename = "GUI")]
+    pub gui: Option<String>,
+
+    /// PGN file to append finished games to - see `resolve_save_pgn`.
+    #[serde(default, rename = "SavePGN")]
+    pub save_pgn: Option<String>,
+
     /// Whether to timeseal-encode our output - see `resolve_timeseal`.
     #[serde(default, rename = "Timeseal")]
     pub timeseal: Option<String>,
@@ -191,18 +211,11 @@ impl ConfigFile {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let cfg = serde_json::from_str(&contents)
-                    .with_context(|| format!("failed to parse {}", path.display()))?;
-                tracing::info!("Loaded config from {}", path.display());
-                Ok(cfg)
+                serde_json::from_str(&contents)
+                    .with_context(|| format!("failed to parse {}", path.display()))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!(
-                    "Config file {} not found - using defaults (guest login, default engine)",
-                    path.display()
-                );
-                Ok(ConfigFile::default())
-            }
+            // Reported by main() once logging is set up.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ConfigFile::default()),
             Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
         }
     }
@@ -285,6 +298,26 @@ impl ConfigFile {
         self.color_board
             .as_deref()
             .is_some_and(|s| s.trim().eq_ignore_ascii_case("yes"))
+    }
+
+    /// Whether to open the desktop window: `GUI` from config.json. Only
+    /// an explicit "Yes" (any case/spacing) turns it on, so headless
+    /// setups never try to open a window by accident.
+    pub fn resolve_gui(&self) -> bool {
+        self.gui
+            .as_deref()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("yes"))
+    }
+
+    /// Where to append finished games as PGN: `SavePGN` from
+    /// config.json (relative to the working directory, like `Book`),
+    /// or `None` when it's absent or blank.
+    pub fn resolve_save_pgn(&self) -> Option<PathBuf> {
+        self.save_pgn
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
     }
 
     /// Whether to speak timeseal: `Timeseal` from config.json. Only an
@@ -489,6 +522,26 @@ mod tests {
         let mut cfg = ConfigFile::default();
         cfg.kibitz = Some("banana".to_string());
         assert_eq!(cfg.resolve_kibitz(), KibitzMode::Off);
+    }
+
+    #[test]
+    fn resolve_gui_only_on_for_explicit_yes() {
+        let mut cfg = ConfigFile::default();
+        assert!(!cfg.resolve_gui());
+        for (s, want) in [("Yes", true), (" yEs ", true), ("No", false), ("banana", false)] {
+            cfg.gui = Some(s.to_string());
+            assert_eq!(cfg.resolve_gui(), want, "input was {s:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_save_pgn_treats_blank_as_off() {
+        let mut cfg = ConfigFile::default();
+        assert_eq!(cfg.resolve_save_pgn(), None);
+        cfg.save_pgn = Some("  ".to_string());
+        assert_eq!(cfg.resolve_save_pgn(), None);
+        cfg.save_pgn = Some(" games.pgn ".to_string());
+        assert_eq!(cfg.resolve_save_pgn(), Some(PathBuf::from("games.pgn")));
     }
 
     #[test]

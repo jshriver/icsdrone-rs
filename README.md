@@ -9,11 +9,16 @@ A Rust rewrite inspired by icsdrone that bridges an Internet Chess Server to a c
 cargo run --release
 ```
 
-Everything - ICS connection, engine, display, timeseal, opening book -
-is configured in `config.json`; see "Config file" below. Copy
-`config.example.json` to `config.json` to get started. Leave
-`Password` unset (in config.json, and in `FICSPASSWD`/`ICSPASSWD`) to
-log in as a guest.
+Everything - ICS connection, engine, display (terminal board or GUI),
+timeseal, opening book, saving games - is configured in
+`config.json`; see "Config file" below. Copy `config.example.json` to
+`config.json` to get started. Leave `Password` unset (in config.json,
+and in `FICSPASSWD`/`ICSPASSWD`) to log in as a guest.
+
+To keep a record of every game the bot plays, set `SavePGN` to a file
+name, e.g. `"SavePGN": "games.pgn"`: each game is appended to it as
+PGN when it ends, ready to open in any chess program. Leave it out or
+set it to `""` to not save games.
 
 ### Command-line flags
 
@@ -68,7 +73,48 @@ Once running, a `>` prompt reads commands from stdin:
   stdin instead, e.g. `engine setoption name Hash value 2048` or
   `engine go depth 20`.
 
+Commands are handled even while the engine is thinking: ICS commands
+are sent right away, and `quit` stops the search and logs off. Only
+`engine ...` has to wait - it's refused with a message until the
+current move is played.
+
 Logs go to stderr so they don't interleave with the prompt.
+
+### GUI
+
+With `"GUI": "Yes"` in config.json, a desktop window opens alongside
+the terminal (Windows, Linux and macOS):
+
+- **Board** with the merida pieces, the last move highlighted, and
+  your side at the bottom.
+- **Player bars** with names and clocks; the side to move's clock
+  counts down live and turns red under 10 seconds.
+- **Engine** panel: best move, score, depth, time, nodes, NPS and the
+  principal variation, in SAN with move numbers (`39... e3 40. Rd3`).
+  Book moves are shown as such.
+- **Moves** list for the current game, with the result once it ends.
+- **Console** showing server output, our commands, kibitz and bot
+  events, with an input line that takes the same commands as the `>`
+  prompt (Up/Down recalls earlier ones).
+- **Status bar**: login state (or the server's login error),
+  timeseal, and the current game number.
+
+The window is the whole interface, so it runs as a standalone app:
+nothing is printed to the terminal and the `>` prompt is off (use the
+window's console instead), `ColorBoard` is ignored, and on Windows the
+console window is released so double-clicking the .exe shows just the
+GUI. Set `RUST_LOG` (e.g. `RUST_LOG=info`) to get logs on stderr
+anyway when debugging. A broken `config.json` is still reported in the
+terminal, since it's read before the window opens. Closing the window
+logs off and shuts the engine down; typing `quit` in the console
+closes the window.
+
+`config.json`, `Book`, `Engine` and `SavePGN` paths are relative to
+the working directory, so when launching it from a desktop shortcut,
+set the shortcut's "Start in" folder to the one holding `config.json`.
+
+The window needs a graphical desktop: on Windows 11 under WSL it opens
+through WSLg, and on a headless server leave `GUI` at `"No"`.
 
 ### Config file
 
@@ -87,7 +133,10 @@ is optional - see `config.example.json`:
   "Engine": "./yourengine",
   "Kibitz": "Yes",
   "ColorBoard": "No",
+  "GUI": "No",
   "Timeseal": "Yes",
+  "SavePGN": "games.pgn",
+  "Book": "file.bin",
   "engine_options": {
     "Hash": "1024",
     "Threads": "4",
@@ -95,8 +144,7 @@ is optional - see `config.example.json`:
     "Ponder": "false",
     "OwnBook": "false",
     "NNUE": "true"
-  },
-  "Book": "file.bin"
+  }
 }
 ```
 
@@ -109,7 +157,9 @@ is optional - see `config.example.json`:
 | `Engine` | engine command line | `engine` |
 | `Kibitz` | `"Yes"` / `"No"` | `"Yes"` |
 | `ColorBoard` | `"Yes"` / `"No"` | `"No"` (plain ASCII board) |
+| `GUI` | `"Yes"` / `"No"` | `"No"` (terminal only) |
 | `Timeseal` | `"Yes"` / `"No"` | `"No"` |
+| `SavePGN` | path to a `.pgn` file | none (games aren't saved) |
 | `engine_options` | `{ "UCI option": "value", ... }` | `Ponder` `false`, `OwnBook` `false`, `NNUE` `true` |
 | `Book` | path to a Polyglot `.bin` | none |
 
@@ -154,6 +204,9 @@ are silently ignored.
   we've made at least one move in the game - it's carried over from
   the previous board redraw and cleared at the start of each new
   game.
+- `GUI`: `"Yes"` or `"No"` (case/whitespace insensitive). `"Yes"`
+  opens the desktop window - see "GUI" above. Only an explicit
+  `"Yes"` turns it on.
 - `Timeseal`: `"Yes"` or `"No"` (case/whitespace insensitive).
   When `"Yes"`, everything sent to the server is timeseal v1 encoded,
   so the server charges our clock for thinking time only - not for
@@ -161,6 +214,14 @@ are silently ignored.
   `[G]` keepalive pings are answered automatically. Defaults to
   `"No"` if omitted, since a server without timeseal support can't
   read the encoded lines; nightmare-chess.nl:5000 supports it.
+- `SavePGN`: path (absolute, or relative to the working directory) of
+  a PGN file. Every game we play is appended to it when it ends, with
+  the usual tags (Event, Site, Date, players, result, ratings when the
+  server gives them, time control) and the server's reason as a final
+  comment, e.g. `{GuestJTMH resigns} 0-1`. The file is created if
+  needed and never overwritten. Games that end before any move (e.g.
+  aborted) are skipped, and a game still in progress when we quit
+  isn't saved. Leave it out, or set it to `""`, to not save games.
 - `engine_options`: any option name the engine supports works here,
   not just Hash/Threads/SyzygyPath - sent to the engine as-is via
   `setoption name <k> value <v>`. `Ponder`, `OwnBook`, and `NNUE` are
@@ -206,7 +267,11 @@ config.json); set it to `"No"` to turn it off.
 | `ics.rs` | TCP connection to the ICS: optional timeseal v1 encoding and ping replies, telnet IAC stripping, line splitting, `--debug` transcript | `net.c` (`OpenTCP`, `SendToIcs`, `ProcessRawInput`) |
 | `board.rs` | Parses `style 12` board lines into a `Style12` struct and converts to FEN | `board.c` (`ParseBoard`, `BoardToFen`) |
 | `engine.rs` | Spawns the engine subprocess, does the UCI handshake (`uci`/`uciok`, `isready`/`readyok`), sends `position`/`go`, parses `bestmove` | `computer.c` (`StartComputer`, `SendMoveToComputer`, `ProcessComputerLine`) — protocol swapped from xboard/CECP to UCI |
-| `app.rs` | Ties it together: login sequence, main event loop reacting to `<12>` lines | `main.c` (login block) + the `ProcessIcsLine`/`ProcessComputerLine` dispatch |
+| `app.rs` | Ties it together: login sequence, main event loop reacting to `<12>` lines and typed commands | `main.c` (login block) + the `ProcessIcsLine`/`ProcessComputerLine` dispatch |
+| `gui.rs` | The optional desktop window (egui/eframe): reads state the bot publishes, sends typed commands back | (new) |
+| `san.rs` | UCI -> SAN conversion for the engine panel (via shakmaty) | (new) |
+| `pgn.rs` | Records our games' moves and appends finished games to the `SavePGN` file | (new) |
+| `main.rs` | Startup: config, logging, runtime; with `GUI` on, the window owns the main thread and the bot runs in the background | `main.c` |
 
 
 ### Aborting a search mid-move
@@ -222,6 +287,8 @@ the next search doesn't mistake it for its own result.
 
 
 ## Acknowledgements
+
+* Armando Hernandez Marroquin for the merida chess pieces (GPLv2+), taken from the Lichess repository - see `assets/pieces/merida/README.md`.
 
 * Joost Buijs for running nightmare-chess.nl ICS server and his monthly (C) tournaments.
 * Marcel van Kervinck fork of icsdrone https://github.com/kervinck/icsdrone

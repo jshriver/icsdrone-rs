@@ -4,6 +4,8 @@
 
 use anyhow::Result;
 use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -12,7 +14,10 @@ use crate::board::{Relation, Style12};
 use crate::book::OpeningBook;
 use crate::config::{Config, ConfigFile, KibitzMode};
 use crate::engine::{SearchResult, UciEngine};
+use crate::gui::{GuiShared, LineKind, SearchView};
 use crate::ics::IcsConn;
+use crate::pgn::{self, GameAnnouncement, PgnGame};
+use crate::san;
 
 pub struct App {
     ics: IcsConn,
@@ -40,25 +45,51 @@ pub struct App {
     /// Reset to `None` at the start of each new game (`reset_game`) -
     /// there's no "last move" to have kibitzed about yet.
     last_kibitz: Option<String>,
+    /// The desktop window, when `GUI` is on. It replaces the terminal
+    /// board; everything else still goes to the terminal as well.
+    gui: Option<Arc<GuiShared>>,
+    /// Typed commands (terminal prompt and GUI console), set by `run`.
+    /// A field rather than a local so `search_or_abort` can keep
+    /// serving them while the engine thinks.
+    commands: Option<mpsc::UnboundedReceiver<String>>,
+    /// Set when "quit" arrives mid-search, so `run` stops once the
+    /// search has been abandoned.
+    quit_requested: bool,
+    /// `SavePGN`: file finished games are appended to, if set.
+    save_pgn: Option<PathBuf>,
+    /// ICS host, for the PGN "Site" tag.
+    site: String,
+    /// The game being recorded for `save_pgn`.
+    pgn_game: Option<PgnGame>,
+    /// The latest "Creating: ..." line, picked up by the next game's
+    /// PGN for its ratings and game type.
+    announcement: Option<GameAnnouncement>,
 }
 
 impl App {
-    pub async fn connect_and_login(config: &Config) -> Result<Self> {
-        // Connection details (Host/Port/Username/Password) and the
-        // engine/book settings all live in the JSON config file now,
-        // so it has to be loaded before we can connect at all.
-        let config_file = ConfigFile::load(&config.config)?;
-
+    pub async fn connect_and_login(
+        config: &Config,
+        config_file: &ConfigFile,
+        gui: Option<Arc<GuiShared>>,
+    ) -> Result<Self> {
         let host = config_file.resolve_host();
         let port = config_file.resolve_port();
         let handle = config_file.resolve_username();
         let password = config_file.resolve_password();
+        let timeseal = config_file.resolve_timeseal();
+
+        if let Some(gui) = &gui {
+            gui.update(|s| {
+                s.status = format!("Connecting to {host}:{port}…");
+                s.timeseal = timeseal;
+            });
+        }
 
         let mut ics = IcsConn::connect(
             &host,
             port,
             config.debug.as_deref(),
-            config_file.resolve_timeseal(),
+            timeseal,
         )
         .await?;
 
@@ -111,6 +142,13 @@ impl App {
         info!("Spawning engine: {}", engine_cmd);
         let engine = UciEngine::spawn(&engine_cmd, &engine_options).await?;
 
+        if let Some(gui) = &gui {
+            gui.update(|s| {
+                s.connected = true;
+                s.status = format!("Connected to {host}:{port} as {handle}");
+            });
+        }
+
         Ok(App {
             ics,
             engine,
@@ -122,6 +160,13 @@ impl App {
             kibitz_mode: config_file.resolve_kibitz(),
             color_board: config_file.resolve_color_board(),
             last_kibitz: None,
+            gui,
+            commands: None,
+            quit_requested: false,
+            save_pgn: config_file.resolve_save_pgn(),
+            site: host,
+            pgn_game: None,
+            announcement: None,
         })
     }
 
@@ -130,32 +175,38 @@ impl App {
     /// to MainLoop()'s select() over the ICS and engine file
     /// descriptors, simplified since in this MVP we only need to react
     /// to the engine when it's actually our move (no ponder/analysis).
-    pub async fn run(&mut self) -> Result<()> {
-        let mut stdin_rx = spawn_stdin_reader();
-        // Flips to false once stdin hits EOF (e.g. running under a
-        // supervisor with no attached terminal), so we stop polling a
-        // permanently-closed channel instead of busy-looping on it.
-        let mut stdin_open = true;
+    ///
+    /// Commands arrive on `cmd_rx`: lines typed at the terminal prompt
+    /// (fed in by a reader task using `cmd_tx`) and, with `GUI` on,
+    /// lines typed in the window's console.
+    pub async fn run(
+        &mut self,
+        cmd_tx: mpsc::UnboundedSender<String>,
+        cmd_rx: mpsc::UnboundedReceiver<String>,
+    ) -> Result<()> {
+        // With the GUI on, its console is the only input; the terminal
+        // isn't used at all.
+        if self.gui.is_none() {
+            spawn_stdin_reader(cmd_tx);
+        }
+        self.commands = Some(cmd_rx);
 
         loop {
+            if self.quit_requested {
+                return Ok(());
+            }
             tokio::select! {
                 line = self.ics.read_line() => {
                     let line = line?;
                     self.handle_ics_line(&line).await?;
                 }
-                cmd = stdin_rx.recv(), if stdin_open => {
-                    match cmd {
-                        Some(cmd) => {
-                            if self.handle_stdin_command(&cmd).await? {
-                                // Operator typed quit/exit - stop the
-                                // event loop so main() can proceed to
-                                // shutdown() and close things down
-                                // cleanly (engine quit, etc.) instead
-                                // of the process just being killed.
-                                return Ok(());
-                            }
-                        }
-                        None => stdin_open = false,
+                cmd = next_command(&mut self.commands) => {
+                    if self.handle_stdin_command(&cmd).await? {
+                        // Operator typed quit/exit - stop the event
+                        // loop so main() can proceed to shutdown() and
+                        // close things down cleanly (engine quit, etc.)
+                        // instead of the process just being killed.
+                        return Ok(());
                     }
                 }
             }
@@ -174,7 +225,34 @@ impl App {
         // people, and we already surface game events (moves, game
         // start/end) separately - printing it too is just noise.
         if !line.contains("<12>") {
-            println!("{}", line.trim_end());
+            show_server_line(self.gui.as_deref(), line);
+        }
+
+        match login_result(line) {
+            Some(Ok(name)) => {
+                // The server may assign a different name than we asked
+                // for (FICS guests become "GuestXXXX").
+                notify(self.gui.as_deref(), &format!("Logged in as {name}"));
+                self.handle = name.trim_end_matches("(U)").to_string();
+                if let Some(gui) = &self.gui {
+                    gui.update(|s| {
+                        s.status = format!("Logged in as {name}");
+                        s.error = None;
+                    });
+                }
+            }
+            Some(Err(())) => {
+                warn!("Login failed: {}", line.trim());
+                if let Some(gui) = &self.gui {
+                    let error = format!("Login failed: {}", line.trim());
+                    gui.update(|s| s.error = Some(error));
+                }
+            }
+            None => {}
+        }
+
+        if let Some(announcement) = pgn::parse_creating(line) {
+            self.announcement = Some(announcement);
         }
 
         if line.contains("<12>") {
@@ -184,7 +262,7 @@ impl App {
             //  variant time inc." - just remember who's challenging;
             // the actual accept/decline happens on the confirmation
             // line below. Mirrors fics.c setting parsingIncoming=TRUE.
-            info!("Incoming challenge from {}", name);
+            notify(self.gui.as_deref(), &format!("Incoming challenge from {name}"));
             self.pending_challenger = Some(name);
         } else if self.pending_challenger.is_some()
             && line.contains("accept")
@@ -194,7 +272,7 @@ impl App {
             // This MVP always accepts (no matchFilter/variant/noplay
             // checks yet, unlike fics.c's InjectChallenge path).
             if let Some(name) = self.pending_challenger.take() {
-                info!("Auto-accepting challenge from {}", name);
+                notify(self.gui.as_deref(), &format!("Auto-accepting challenge from {name}"));
                 self.ics.send(&format!("accept {name}")).await?;
             }
         } else if is_game_over_line(line) {
@@ -206,8 +284,8 @@ impl App {
             // "result", adjourn bookkeeping, etc.); for this MVP we
             // just need to know the game is over so we stop treating
             // any further style12 lines as belonging to it.
-            info!("Game ended: {}", line.trim());
-            self.reset_game();
+            notify(self.gui.as_deref(), &format!("Game ended: {}", line.trim()));
+            self.game_over(line);
         } else if line.contains("no longer") && line.contains("observing") {
             // benign
         } else {
@@ -229,6 +307,7 @@ impl App {
     /// setoption name Hash value 2048", "engine go depth 20") for
     /// poking at it directly.
     async fn handle_stdin_command(&mut self, cmd: &str) -> Result<bool> {
+        echo_command(self.gui.as_deref(), cmd);
         if is_quit_command(cmd) {
             info!("Quit requested at prompt, logging off and shutting down");
             // Best-effort: the ICS may already be gone, or may drop us
@@ -254,6 +333,19 @@ impl App {
         self.last_kibitz = None;
     }
 
+    /// The game we're playing has ended on `line` ("{Game N (...) ...}
+    /// result"): stop tracking it, and freeze the window's clocks with
+    /// the result shown under the moves.
+    fn game_over(&mut self, line: &str) {
+        self.reset_game();
+        self.save_game(line);
+        if let Some(gui) = &self.gui {
+            // Drop anything (e.g. a "fics% " prompt) run in front of it.
+            let result = line.find("{Game").map_or(line, |i| &line[i..]).trim().to_string();
+            gui.update(|s| s.game_over = Some(result));
+        }
+    }
+
     /// Combines the `White`/`Black`/`Move`/`Clock`/`Kibitz` header with the board
     /// render into what actually gets printed, prefixed with an ANSI
     /// "clear screen, cursor home" escape only when `ansi_ok` is true.
@@ -270,6 +362,53 @@ impl App {
         } else {
             format!("{header}\n\n{board_str}")
         }
+    }
+
+    /// With `SavePGN` set, append the recorded game that `line` ("{Game
+    /// N (...) reason} result") ends to the PGN file. Games that ended
+    /// before any move (e.g. aborted) aren't saved.
+    fn save_game(&mut self, line: &str) {
+        let (Some(path), Some(end)) = (&self.save_pgn, pgn::parse_game_end(line)) else {
+            return;
+        };
+        let Some(game) = self.pgn_game.take_if(|g| g.game_number == end.game_number) else {
+            return;
+        };
+        if !game.has_moves() {
+            return;
+        }
+        match pgn::append(path, &game.to_pgn(&end)) {
+            Ok(()) => notify(
+                self.gui.as_deref(),
+                &format!("Saved game {} to {}", end.game_number, path.display()),
+            ),
+            Err(e) => {
+                let msg = format!("Could not save game to {}: {e}", path.display());
+                warn!("{msg}");
+                if let Some(gui) = &self.gui {
+                    gui.console(LineKind::Error, msg);
+                }
+            }
+        }
+    }
+
+    /// Print `board` and its header (players, last move, clocks, last
+    /// kibitz) to the terminal, plain or colored per `ColorBoard`.
+    fn print_board(&self, board: &Style12) {
+        let mut header = format!(
+            "White: {}  Black: {}\nMove: {}\nClock: White {}  Black {}",
+            board.white_name,
+            board.black_name,
+            board.last_move_verbose,
+            format_clock(board.white_time_ms),
+            format_clock(board.black_time_ms)
+        );
+        if let Some(kibitz) = &self.last_kibitz {
+            header.push_str(&format!("\nKibitz: {kibitz}"));
+        }
+
+        let board_str = board.to_board_string(self.color_board);
+        println!("{}", Self::board_frame(&header, &board_str, self.color_board));
     }
 
     async fn handle_style12(&mut self, line: &str) -> Result<()> {
@@ -291,34 +430,39 @@ impl App {
         // first board doesn't show a stale kibitz line left over from
         // the previous game.
         if self.game_number != Some(board.game_number) {
-            info!(
-                "New game #{}: {} (white) vs {} (black)",
-                board.game_number, board.white_name, board.black_name
+            notify(
+                self.gui.as_deref(),
+                &format!(
+                    "New game #{}: {} (white) vs {} (black)",
+                    board.game_number, board.white_name, board.black_name
+                ),
             );
             self.game_number = Some(board.game_number);
             self.we_are_white = Some(board.white_name == self.handle);
             self.last_kibitz = None;
         }
 
+        if self.save_pgn.is_some() {
+            if self.pgn_game.as_ref().map(|g| g.game_number) != Some(board.game_number) {
+                let announcement = self.announcement.take();
+                self.pgn_game = Some(PgnGame::new(&board, &self.site, announcement.as_ref()));
+            }
+            if let Some(game) = &mut self.pgn_game {
+                game.record(&board);
+            }
+        }
+
         // Every style12 line for a game we're playing describes the
         // board right after a ply was made - by us or by the opponent,
         // whichever relation above matched. Show it to the operator
         // either way, so they can follow the game locally without
-        // needing a separate ICS client observing it.
-        let mut header = format!(
-            "White: {}  Black: {}\nMove: {}\nClock: White {}  Black {}",
-            board.white_name,
-            board.black_name,
-            board.last_move_verbose,
-            format_clock(board.white_time_ms),
-            format_clock(board.black_time_ms)
-        );
-        if let Some(kibitz) = &self.last_kibitz {
-            header.push_str(&format!("\nKibitz: {kibitz}"));
+        // needing a separate ICS client observing it. With the GUI on,
+        // the window shows it instead of the terminal.
+        if let Some(gui) = &self.gui {
+            gui.update(|s| s.new_board(board.clone()));
+        } else {
+            self.print_board(&board);
         }
-
-        let board_str = board.to_board_string(self.color_board);
-        println!("{}", Self::board_frame(&header, &board_str, self.color_board));
 
         if !matches!(board.relation, Relation::PlayingMyMove) {
             return Ok(()); // opponent to move (or we just moved), nothing to do
@@ -339,6 +483,16 @@ impl App {
         // search from here".
         if let Some(book_move) = self.book.as_ref().and_then(|b| b.best_move_from_fen(&fen)) {
             info!("Book move: {}", book_move);
+            if let Some(gui) = &self.gui {
+                gui.update(|s| {
+                    s.search = Some(SearchView {
+                        bestmove: san::move_to_san(&fen, &book_move),
+                        from_book: true,
+                        info: None,
+                        pv: None,
+                    })
+                });
+            }
             self.ics.send(&to_ics_move(&book_move)).await?;
             return Ok(());
         }
@@ -377,9 +531,29 @@ impl App {
             let stats = info.format_kibitz();
             self.last_kibitz = Some(stats.clone());
             if let Some(cmd) = self.kibitz_mode.ics_command() {
-                println!("[kibitz] {stats}");
+                match &self.gui {
+                    Some(gui) => gui.console(LineKind::Kibitz, format!("[kibitz] {stats}")),
+                    None => println!("[kibitz] {stats}"),
+                }
                 self.ics.send(&format!("{cmd} {stats}")).await?;
             }
+        }
+        if let Some(gui) = &self.gui {
+            gui.update(|s| {
+                if let Some(info) = &result.info {
+                    s.push_score(&board, info);
+                }
+                s.search = Some(SearchView {
+                    bestmove: san::move_to_san(&fen, &result.bestmove),
+                    from_book: false,
+                    info: result.info.clone(),
+                    pv: result
+                        .info
+                        .as_ref()
+                        .and_then(|i| i.pv.as_deref())
+                        .map(|pv| san::line_to_san(&fen, pv)),
+                })
+            });
         }
 
         self.ics.send(&to_ics_move(&result.bestmove)).await?;
@@ -399,6 +573,11 @@ impl App {
     /// echoed the same way the main loop does but not otherwise acted
     /// on - full dispatch resumes once this move is decided, same as
     /// before this method existed.
+    ///
+    /// Typed commands are still served while thinking: ICS commands go
+    /// out right away, "quit" abandons the search and quits (`Ok(None)`
+    /// with `quit_requested` set), and "engine ..." is refused since
+    /// the engine is mid-search.
     async fn search_or_abort(
         &mut self,
         game_number: i32,
@@ -420,10 +599,13 @@ impl App {
                 line = self.ics.read_line() => {
                     let line = line?;
                     if !line.trim().is_empty() && !line.contains("<12>") {
-                        println!("{}", line.trim_end());
+                        show_server_line(self.gui.as_deref(), &line);
                     }
                     if is_game_over_line(&line) && line.contains(&marker) {
-                        info!("Game {} ended while engine was thinking - aborting search: {}", game_number, line.trim());
+                        notify(
+                            self.gui.as_deref(),
+                            &format!("Game {} ended while engine was thinking - aborting search: {}", game_number, line.trim()),
+                        );
                         // Drop the in-progress search first: it holds
                         // the engine's only &mut borrow, and stop()
                         // needs one of its own to send "stop" and
@@ -432,8 +614,29 @@ impl App {
                         if let Err(e) = self.engine.stop().await {
                             warn!("failed to abort engine search cleanly: {e}");
                         }
-                        self.reset_game();
+                        self.game_over(&line);
                         return Ok(None);
+                    }
+                }
+                cmd = next_command(&mut self.commands) => {
+                    echo_command(self.gui.as_deref(), &cmd);
+                    if is_quit_command(&cmd) {
+                        info!("Quit requested while engine was thinking - stopping search and logging off");
+                        drop(search);
+                        if let Err(e) = self.engine.stop().await {
+                            warn!("failed to abort engine search cleanly: {e}");
+                        }
+                        let _ = self.ics.send("quit").await;
+                        self.quit_requested = true;
+                        return Ok(None);
+                    } else if cmd.starts_with("engine ") {
+                        notify(
+                            self.gui.as_deref(),
+                            "The engine is busy with a search; send engine commands after this move.",
+                        );
+                    } else {
+                        info!("-> ics (manual): {}", cmd);
+                        self.ics.send(&cmd).await?;
                     }
                 }
             }
@@ -446,13 +649,12 @@ impl App {
 }
 
 /// Spawn a background task that prints a `> ` prompt, reads lines typed
-/// on stdin, and forwards each non-empty one down the returned channel.
+/// on stdin, and forwards each non-empty one down `tx`.
 /// Kept as a separate task (rather than reading stdin inline in `run`)
 /// so it doesn't block the select loop between keystrokes. Ends cleanly
 /// on EOF (e.g. stdin redirected from /dev/null under a supervisor)
 /// rather than erroring.
-fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<String> {
-    let (tx, rx) = mpsc::unbounded_channel();
+fn spawn_stdin_reader(tx: mpsc::UnboundedSender<String>) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         loop {
@@ -478,13 +680,52 @@ fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<String> {
             }
         }
     });
-    rx
+}
+
+/// The next typed command. Once the sender side is gone (stdin hit EOF
+/// with no GUI, e.g. under a supervisor), waits forever instead of
+/// returning `None` in a busy loop.
+async fn next_command(commands: &mut Option<mpsc::UnboundedReceiver<String>>) -> String {
+    if let Some(rx) = commands {
+        if let Some(cmd) = rx.recv().await {
+            return cmd;
+        }
+        *commands = None;
+    }
+    std::future::pending().await
+}
+
+/// Show a typed command in the window's console (the terminal already
+/// shows what was typed there).
+fn echo_command(gui: Option<&GuiShared>, cmd: &str) {
+    if let Some(gui) = gui {
+        gui.console(LineKind::Sent, format!("> {cmd}"));
+    }
+}
+
+/// Show a line from the ICS in the window's console, or on the
+/// terminal when there's no window.
+fn show_server_line(gui: Option<&GuiShared>, line: &str) {
+    let line = line.trim_end();
+    match gui {
+        Some(gui) => gui.console(LineKind::Server, line),
+        None => println!("{line}"),
+    }
+}
+
+/// Log a bot event (new game, game over, challenge, ...) and show it in
+/// the window's console.
+fn notify(gui: Option<&GuiShared>, text: &str) {
+    info!("{text}");
+    if let Some(gui) = gui {
+        gui.console(LineKind::System, text);
+    }
 }
 
 /// Remaining clock time as "m:ss", or "h:mm:ss" from an hour up.
 /// Style12 clocks can go negative when a player overstays their time
 /// before the flag is called, so keep the sign rather than hiding it.
-fn format_clock(ms: i64) -> String {
+pub(crate) fn format_clock(ms: i64) -> String {
     let sign = if ms < 0 { "-" } else { "" };
     let secs = ms.abs() / 1000;
     let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
@@ -528,6 +769,34 @@ fn parse_challenge_name(line: &str) -> Option<String> {
     rest.trim().split_whitespace().next().map(|s| s.to_string())
 }
 
+/// Whether `line` reports the outcome of our login: `Some(Ok(name))`
+/// with the name we're logged in under ("Logged in as Erebus." on
+/// LaskerRevisited, "**** Starting FICS session as GuestPSPD(U) ****"
+/// on FICS), `Some(Err)` for the server's rejections (wrong password,
+/// unknown account, handle already in use - including the single
+/// guest account), `None` for anything else.
+fn login_result(line: &str) -> Option<Result<String, ()>> {
+    let line = line.trim();
+    let name = line
+        .strip_prefix("Logged in as ")
+        .map(|rest| rest.trim_end_matches('.'))
+        .or_else(|| {
+            let rest = &line[line.find("**** Starting FICS session as ")? + 30..];
+            Some(rest.trim_end_matches('*').trim())
+        });
+    if let Some(name) = name {
+        Some(Ok(name.to_string()))
+    } else if line.starts_with("Invalid password")
+        || line.starts_with("Unknown account")
+        || line.contains("already logged in")
+        || line.contains("already in use")
+    {
+        Some(Err(()))
+    } else {
+        None
+    }
+}
+
 /// True for any ICS line announcing that a game has ended: checkmate,
 /// resignation, stalemate, draw, or adjournment. These always take the
 /// shape `{Game N (white vs. black) <reason>} <result>` where result is
@@ -547,6 +816,25 @@ fn is_game_over_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_login_results() {
+        assert_eq!(login_result("Logged in as Erebus."), Some(Ok("Erebus".to_string())));
+        assert_eq!(
+            login_result("**** Starting FICS session as GuestPSPD(U) ****"),
+            Some(Ok("GuestPSPD(U)".to_string()))
+        );
+        for line in [
+            "password: Invalid password.",
+            "Unknown account. Use guest or try again.",
+            "password: That account is already logged in.",
+            "The guest account is already in use. Please use a registered account.",
+        ] {
+            let line = line.trim_start_matches("password: ");
+            assert_eq!(login_result(line), Some(Err(())), "{line}");
+        }
+        assert_eq!(login_result("fics% tell bob logged in as guest"), None);
+    }
 
     #[test]
     fn converts_promotions_to_ics_form() {

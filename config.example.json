@@ -6,7 +6,10 @@
   "Engine": "./yourengine",
   "Kibitz": "Yes",
   "ColorBoard": "No",
+  "GUI": "No",
   "Timeseal": "Yes",
+  "SavePGN": "games.pgn",
+  "Book": "file.bin",
   "engine_options": {
     "Hash": "1024",
     "Threads": "4",
@@ -14,6 +17,5 @@
     "Ponder": "false",
     "OwnBook": "false",
     "NNUE": "true"
-  },
-  "Book": "file.bin"
+  }
 }
