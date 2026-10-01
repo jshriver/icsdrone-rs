@@ -31,13 +31,9 @@ pub struct App {
     kibitz_mode: KibitzMode,
     /// Whether the console board is ANSI-colored (highlighting the
     /// previous move's from/to squares) or plain. `ColorBoard` in
-    /// config.json, default Yes - see
+    /// config.json, default plain - see
     /// `ConfigFile::resolve_color_board`.
     color_board: bool,
-    /// Whether the console board is displayed at all. `DisplayBoard`
-    /// in config.json, default `true` - see
-    /// `ConfigFile::resolve_display_board`.
-    display_board: bool,
     /// Search-stats line from the most recent kibitz/whisper (see
     /// `format_kibitz`), shown under the board on the following
     /// redraw so the operator can see it without scrolling back.
@@ -111,7 +107,7 @@ impl App {
             }
         };
 
-        let engine_cmd = config_file.resolve_engine(config.engine.as_deref());
+        let engine_cmd = config_file.resolve_engine();
         info!("Spawning engine: {}", engine_cmd);
         let engine = UciEngine::spawn(&engine_cmd, &engine_options).await?;
 
@@ -125,7 +121,6 @@ impl App {
             pending_challenger: None,
             kibitz_mode: config_file.resolve_kibitz(),
             color_board: config_file.resolve_color_board(),
-            display_board: config_file.resolve_display_board(),
             last_kibitz: None,
         })
     }
@@ -309,24 +304,21 @@ impl App {
         // board right after a ply was made - by us or by the opponent,
         // whichever relation above matched. Show it to the operator
         // either way, so they can follow the game locally without
-        // needing a separate ICS client observing it - unless
-        // `DisplayBoard` turned board display off entirely.
-        if self.display_board {
-            let mut header = format!(
-                "White: {}  Black: {}\nMove: {}\nClock: White {}  Black {}",
-                board.white_name,
-                board.black_name,
-                board.last_move_verbose,
-                format_clock(board.white_time_ms),
-                format_clock(board.black_time_ms)
-            );
-            if let Some(kibitz) = &self.last_kibitz {
-                header.push_str(&format!("\nKibitz: {kibitz}"));
-            }
-
-            let board_str = board.to_board_string(self.color_board);
-            println!("{}", Self::board_frame(&header, &board_str, self.color_board));
+        // needing a separate ICS client observing it.
+        let mut header = format!(
+            "White: {}  Black: {}\nMove: {}\nClock: White {}  Black {}",
+            board.white_name,
+            board.black_name,
+            board.last_move_verbose,
+            format_clock(board.white_time_ms),
+            format_clock(board.black_time_ms)
+        );
+        if let Some(kibitz) = &self.last_kibitz {
+            header.push_str(&format!("\nKibitz: {kibitz}"));
         }
+
+        let board_str = board.to_board_string(self.color_board);
+        println!("{}", Self::board_frame(&header, &board_str, self.color_board));
 
         if !matches!(board.relation, Relation::PlayingMyMove) {
             return Ok(()); // opponent to move (or we just moved), nothing to do

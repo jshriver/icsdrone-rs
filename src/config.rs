@@ -7,42 +7,22 @@ use std::path::{Path, PathBuf};
 const DEFAULT_ICS_HOST: &str = "nightmare-chess.nl";
 /// Default ICS port, used when `Port` is absent from config.json.
 const DEFAULT_ICS_PORT: u16 = 5000;
-/// Default UCI engine command, used when neither `--engine` on the
-/// command line nor `Engine` in config.json is set.
+/// Default UCI engine command, used when `Engine` is absent from
+/// config.json.
 const DEFAULT_ENGINE_COMMAND: &str = "engine";
 
 /// icsdrone-rs: bridges an Internet Chess Server (ICS, e.g. FICS) to a
 /// UCI chess engine. Rust rewrite of icsdroneng, using UCI instead of
 /// the original xboard/CECP protocol to talk to the engine.
 ///
-/// ICS connection details (host, port, username, password) live in
-/// the JSON config file (see `--config`), not on the command line -
-/// see `ConfigFile`.
+/// Everything is configured in the JSON config file (`--config`,
+/// default config.json); the command line only picks that file and
+/// turns on the `--debug` transcript.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "icsdrone-rs", version, about)]
 pub struct Config {
-    /// Command line used to launch the UCI engine, e.g. "engine" or
-    /// "/path/to/engine --some-flag". Overrides `Engine` in config.json
-    /// if both are set; falls back to `Engine` from config.json, then
-    /// to "engine", if omitted.
-    #[arg(long)]
-    pub engine: Option<String>,
-
-    /// Base time in minutes for the match clock (used only for our own
-    /// bookkeeping / time management, not sent at login)
-    #[arg(long, default_value_t = 5)]
-    pub base_minutes: u32,
-
-    /// Increment in seconds
-    #[arg(long, default_value_t = 0)]
-    pub increment_seconds: u32,
-
-    /// Log level: error, warn, info, debug, trace
-    #[arg(long, default_value = "info")]
-    pub log_level: String,
-
-    /// Path to a JSON config file with the ICS connection details
-    /// (Host/Port/Username/Password), UCI engine options, and an
+    /// Path to the JSON config file with all settings: ICS connection
+    /// details, engine command and options, display, timeseal, and
     /// opening book. Silently uses defaults for anything not present
     /// if the file doesn't exist; an error if it exists but is
     /// malformed.
@@ -109,7 +89,6 @@ impl KibitzMode {
 ///   "Engine": "engine",
 ///   "Kibitz": "Yes",
 ///   "ColorBoard": "Yes",
-///   "DisplayBoard": "True",
 ///   "Timeseal": "Yes",
 ///   "engine_options": {
 ///     "Hash": "1024",
@@ -128,10 +107,8 @@ impl KibitzMode {
 /// $FICSPASSWD/$ICSPASSWD respectively, then to a guest login if
 /// still unset - see `resolve_username`/`resolve_password`.
 ///
-/// `Engine` is the command line used to launch the UCI engine, same
-/// idea as `--engine` on the command line. `--engine`, if given, takes
-/// precedence over `Engine` here; if neither is set, it falls back to
-/// "engine" - see `resolve_engine`.
+/// `Engine` is the command line used to launch the UCI engine; it
+/// falls back to "engine" if absent - see `resolve_engine`.
 ///
 /// `Kibitz` turns search-stat announcements (via ICS "whisper", never
 /// the public "kibitz" channel) on or off. Accepts "Yes"/"No" in any
@@ -139,13 +116,9 @@ impl KibitzMode {
 /// "Yes" (whisper on) if absent - see `resolve_kibitz`.
 ///
 /// `ColorBoard` turns ANSI move-highlighting on the console board on
-/// or off. Same "Yes"/"No" parsing as `Kibitz`; defaults to "Yes"
-/// (colored) if absent - see `resolve_color_board`.
-///
-/// `DisplayBoard` turns the console board display itself on or off -
-/// when "False", the board is never printed at all, regardless of
-/// `ColorBoard`. Accepts "True"/"False" in any case or spacing;
-/// defaults to "True" if absent - see `resolve_display_board`.
+/// or off. The board itself is always printed; this only picks
+/// colored vs. plain ASCII. Same "Yes"/"No" parsing as `Kibitz`;
+/// defaults to "No" (plain) if absent - see `resolve_color_board`.
 ///
 /// `Timeseal` turns on timeseal v1 encoding of everything we send, so
 /// the server charges us for thinking time only, not network lag.
@@ -191,20 +164,10 @@ pub struct ConfigFile {
     /// `app.rs`) is drawn with ANSI colors highlighting the previous
     /// move's from/to squares, or left as the plain uncolored board.
     /// Accepts "Yes"/"No" in any case or spacing, same as `Kibitz`;
-    /// defaults to "Yes" (colored) if absent - see
+    /// defaults to "No" (plain) if absent - see
     /// `resolve_color_board`.
     #[serde(default, rename = "ColorBoard")]
     pub color_board: Option<String>,
-
-    /// Whether the console board is displayed at all. Unlike
-    /// `ColorBoard` (which only controls styling), setting this to
-    /// `"False"` suppresses the board output entirely. Accepts
-    /// "True"/"False" in any case or spacing, same parsing as
-    /// `ColorBoard`/`Kibitz`; defaults to "True" (display it, as
-    /// before this option existed) if absent - see
-    /// `resolve_display_board`.
-    #[serde(default, rename = "DisplayBoard")]
-    pub display_board: Option<String>,
 
     /// Whether to timeseal-encode our output - see `resolve_timeseal`.
     #[serde(default, rename = "Timeseal")]
@@ -278,14 +241,11 @@ impl ConfigFile {
             .or_else(|| std::env::var("ICSPASSWD").ok())
     }
 
-    /// Command line used to launch the UCI engine: `--engine` on the
-    /// command line if given (it always wins, even over `Engine` in
-    /// config.json), else `Engine` from config.json, else
-    /// `DEFAULT_ENGINE_COMMAND`.
-    pub fn resolve_engine(&self, cli_engine: Option<&str>) -> String {
-        cli_engine
-            .map(str::to_string)
-            .or_else(|| self.engine.clone())
+    /// Command line used to launch the UCI engine: `Engine` from
+    /// config.json, else `DEFAULT_ENGINE_COMMAND`.
+    pub fn resolve_engine(&self) -> String {
+        self.engine
+            .clone()
             .unwrap_or_else(|| DEFAULT_ENGINE_COMMAND.to_string())
     }
 
@@ -317,31 +277,14 @@ impl ConfigFile {
 
     /// Whether to draw the console board with ANSI move highlighting:
     /// `ColorBoard` from config.json, case-/whitespace-insensitively
-    /// flattened to Yes/No. Defaults to "Yes" (colored) if
-    /// `ColorBoard` is absent entirely. Unlike `Kibitz` (where an
-    /// unrecognized value falls back to the quieter "No"), an
-    /// unrecognized `ColorBoard` value falls back to the default
-    /// "Yes" - the display is purely cosmetic, so there's no safety
-    /// reason to prefer the plain board, and only an explicit "No"
-    /// should turn coloring off.
+    /// flattened to Yes/No. Only an explicit "Yes" turns color on;
+    /// absent or unrecognized values give the plain ASCII board, which
+    /// works on any terminal (and in a redirected log) - ANSI color is
+    /// opt-in.
     pub fn resolve_color_board(&self) -> bool {
-        match &self.color_board {
-            Some(s) => !s.trim().eq_ignore_ascii_case("no"),
-            None => true,
-        }
-    }
-
-    /// Whether to display the console board at all: `DisplayBoard`
-    /// from config.json, defaulting to "True" (display it, matching
-    /// behavior before this option existed) if absent. Same
-    /// "unrecognized value falls back to the default" reasoning as
-    /// `resolve_color_board` above - only an explicit "False" should
-    /// turn the board off.
-    pub fn resolve_display_board(&self) -> bool {
-        match &self.display_board {
-            Some(s) => !s.trim().eq_ignore_ascii_case("false"),
-            None => true,
-        }
+        self.color_board
+            .as_deref()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("yes"))
     }
 
     /// Whether to speak timeseal: `Timeseal` from config.json. Only an
@@ -505,23 +448,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_engine_prefers_cli_over_config_file() {
+    fn resolve_engine_uses_config_file() {
         let mut cfg = ConfigFile::default();
         cfg.engine = Some("config-engine".to_string());
-        assert_eq!(cfg.resolve_engine(Some("cli-engine")), "cli-engine");
-    }
-
-    #[test]
-    fn resolve_engine_falls_back_to_config_file() {
-        let mut cfg = ConfigFile::default();
-        cfg.engine = Some("config-engine".to_string());
-        assert_eq!(cfg.resolve_engine(None), "config-engine");
+        assert_eq!(cfg.resolve_engine(), "config-engine");
     }
 
     #[test]
     fn resolve_engine_defaults_to_default_engine_command() {
         let cfg = ConfigFile::default();
-        assert_eq!(cfg.resolve_engine(None), DEFAULT_ENGINE_COMMAND);
+        assert_eq!(cfg.resolve_engine(), DEFAULT_ENGINE_COMMAND);
     }
 
     #[test]
@@ -566,9 +502,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_color_board_defaults_to_yes_when_absent() {
+    fn resolve_color_board_defaults_to_plain_when_absent() {
         let cfg = ConfigFile::default();
-        assert!(cfg.resolve_color_board());
+        assert!(!cfg.resolve_color_board());
     }
 
     #[test]
@@ -590,11 +526,25 @@ mod tests {
     }
 
     #[test]
-    fn resolve_color_board_treats_garbage_as_yes() {
-        // Unlike Kibitz, an unrecognized ColorBoard value should keep
-        // the (colored) default rather than silently turning it off.
+    fn resolve_color_board_treats_garbage_as_plain() {
+        // Color is opt-in: anything but an explicit "Yes" keeps the
+        // plain board.
         let mut cfg = ConfigFile::default();
         cfg.color_board = Some("banana".to_string());
+        assert!(!cfg.resolve_color_board());
+    }
+
+    #[test]
+    fn ignores_removed_display_board_field() {
+        // Old config files may still carry DisplayBoard; it must not
+        // stop them loading.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("icsdrone-test-displayboard-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"DisplayBoard": "False", "ColorBoard": "Yes"}"#).unwrap();
+
+        let cfg = ConfigFile::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
         assert!(cfg.resolve_color_board());
     }
 
@@ -608,52 +558,6 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(!cfg.resolve_color_board());
-    }
-
-    #[test]
-    fn resolve_display_board_defaults_to_true_when_absent() {
-        let cfg = ConfigFile::default();
-        assert!(cfg.resolve_display_board());
-    }
-
-    #[test]
-    fn resolve_display_board_flattens_false_variants() {
-        for s in ["False", "false", "FALSE", "fAlSe", " False "] {
-            let mut cfg = ConfigFile::default();
-            cfg.display_board = Some(s.to_string());
-            assert!(!cfg.resolve_display_board(), "input was {s:?}");
-        }
-    }
-
-    #[test]
-    fn resolve_display_board_flattens_true_variants() {
-        for s in ["True", "true", "TRUE", "tRuE", " True "] {
-            let mut cfg = ConfigFile::default();
-            cfg.display_board = Some(s.to_string());
-            assert!(cfg.resolve_display_board(), "input was {s:?}");
-        }
-    }
-
-    #[test]
-    fn resolve_display_board_treats_garbage_as_true() {
-        // Same reasoning as ColorBoard: an unrecognized DisplayBoard
-        // value should keep the (displayed) default rather than
-        // silently turning the board off.
-        let mut cfg = ConfigFile::default();
-        cfg.display_board = Some("banana".to_string());
-        assert!(cfg.resolve_display_board());
-    }
-
-    #[test]
-    fn parses_display_board_field() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("icsdrone-test-displayboard-{}.json", std::process::id()));
-        std::fs::write(&path, r#"{"DisplayBoard": "False"}"#).unwrap();
-
-        let cfg = ConfigFile::load(&path).unwrap();
-        std::fs::remove_file(&path).ok();
-
-        assert!(!cfg.resolve_display_board());
     }
 
     #[test]

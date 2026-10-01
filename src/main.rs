@@ -54,11 +54,12 @@ async fn main() -> Result<()> {
     let config = Config::parse();
 
     // Logs go to stderr so they don't interleave with the interactive
-    // `>` prompt / its output on stdout.
+    // `>` prompt / its output on stdout. Level is `info` unless the
+    // RUST_LOG environment variable says otherwise.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| config.log_level.clone().into()),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 

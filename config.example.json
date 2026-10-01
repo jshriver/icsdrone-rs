@@ -5,8 +5,7 @@
   "Password": "yourpass",
   "Engine": "./yourengine",
   "Kibitz": "Yes",
-  "ColorBoard": "Yes",
-  "DisplayBoard": "True",
+  "ColorBoard": "No",
   "Timeseal": "Yes",
   "engine_options": {
     "Hash": "1024",

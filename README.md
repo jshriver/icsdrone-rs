@@ -6,26 +6,54 @@ A Rust rewrite inspired by icsdrone that bridges an Internet Chess Server to a c
 ## Usage
 
 ```
-cargo run --release -- \
-  --engine "/path/to/engine"
+cargo run --release
 ```
 
-ICS connection details (host, port, username, password) come from
-`config.json` now, not the command line — see "Config file" below.
-Leave `Password` unset (in config.json, and in `FICSPASSWD`/`ICSPASSWD`)
-to log in as a guest.
+Everything - ICS connection, engine, display, timeseal, opening book -
+is configured in `config.json`; see "Config file" below. Copy
+`config.example.json` to `config.json` to get started. Leave
+`Password` unset (in config.json, and in `FICSPASSWD`/`ICSPASSWD`) to
+log in as a guest.
 
 ### Command-line flags
 
-All optional — every one has a default or falls back to config.json:
+Both optional:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--engine <cmd>` | (none) | Command line used to launch the UCI engine, e.g. `"engine"` or `"/path/to/engine --some-flag"`. Always wins over `Engine` in config.json if both are set; if neither is set, falls back to `"engine"`. |
 | `--config <path>` | `config.json` | Path to the JSON config file (see "Config file" below). A missing file is fine (defaults/guest login apply); a malformed one is an error. |
-| `--log-level <level>` | `info` | `error`, `warn`, `info`, `debug`, or `trace`. Logs go to stderr so they don't interleave with the interactive `>` prompt's output on stdout. |
-| `--base-minutes <n>` | `5` | Base time in minutes for the match clock — used only for icsdrone-rs's own bookkeeping/time management, not sent to the ICS at login. |
-| `--increment-seconds <n>` | `0` | Increment in seconds, same bookkeeping-only purpose as `--base-minutes`. |
+| `--debug <file>` | (off) | Append a timestamped, raw transcript of everything sent to and received from the ICS to `<file>` — see "Debugging the ICS connection" below. |
+
+`--help` lists the flags and `--version` prints the version.
+
+Logs go to stderr at `info` level, so they don't interleave with the
+interactive `>` prompt's output on stdout. For more or less detail,
+set the `RUST_LOG` environment variable (`error`, `warn`, `info`,
+`debug` or `trace`), e.g. `RUST_LOG=debug cargo run --release`.
+
+### Debugging the ICS connection
+
+`--debug <file>` records the session at the wire level, for chasing
+server-side bugs or network trouble:
+
+```
+13:11:17.295 -> "d2f3\n"
+13:11:19.418 <- "\r<12> --r---k- pr---ppn ... N/d2-f3 (0:00) Nf3 0 1\n"
+13:11:28.314 <- "[G]\x00"
+13:11:28.314 -> "<timeseal ping reply>\n"
+```
+
+- `->` is sent to the server, `<-` received from it; `--` marks
+  events (connect, disconnect, timeseal on).
+- Timestamps are UTC wall-clock time, to line up with server logs.
+- Incoming data is logged exactly as received, before telnet codes are
+  stripped or lines are split; control bytes are escaped (`\r`,
+  `\n`, `\x00`, ...) so stray ones are visible.
+- With `Timeseal` on, outgoing lines are logged as plain text, before
+  encoding.
+- The password is always masked as `********`, so the file is safe to
+  share.
+- The file is appended to, never overwritten.
 
 ### Interactive prompt
 
@@ -45,9 +73,10 @@ Logs go to stderr so they don't interleave with the prompt.
 ### Config file
 
 `--config` (default `config.json`) points at a JSON file with the ICS
-connection details, UCI engine options (applied via `setoption` right
-after the engine identifies itself and before the first `isready`),
-and an optional opening book:
+connection details, display and protocol settings, UCI engine options
+(applied via `setoption` right after the engine identifies itself and
+before the first `isready`), and an optional opening book. Every key
+is optional - see `config.example.json`:
 
 ```json
 {
@@ -57,8 +86,7 @@ and an optional opening book:
   "Password": "yourpass",
   "Engine": "./yourengine",
   "Kibitz": "Yes",
-  "ColorBoard": "Yes",
-  "DisplayBoard": "True",
+  "ColorBoard": "No",
   "Timeseal": "Yes",
   "engine_options": {
     "Hash": "1024",
@@ -72,34 +100,45 @@ and an optional opening book:
 }
 ```
 
+| Key | Values | Default |
+|---|---|---|
+| `Host` | hostname | `nightmare-chess.nl` |
+| `Port` | number | `5000` |
+| `Username` | ICS handle | `$FICSHANDLE`, then `$ICSHANDLE`, then `guest` |
+| `Password` | ICS password | `$FICSPASSWD`, then `$ICSPASSWD`, then none (guest) |
+| `Engine` | engine command line | `engine` |
+| `Kibitz` | `"Yes"` / `"No"` | `"Yes"` |
+| `ColorBoard` | `"Yes"` / `"No"` | `"No"` (plain ASCII board) |
+| `Timeseal` | `"Yes"` / `"No"` | `"No"` |
+| `engine_options` | `{ "UCI option": "value", ... }` | `Ponder` `false`, `OwnBook` `false`, `NNUE` `true` |
+| `Book` | path to a Polyglot `.bin` | none |
+
+Yes/No values are case- and whitespace-insensitive. Keys are
+case-sensitive, and unknown keys (such as the removed `DisplayBoard`)
+are silently ignored.
+
 - `Host`/`Port` default to `nightmare-chess.nl`/`5000` if omitted.
 - `Username`: ICS handle to log in as. Falls back to `$FICSHANDLE`,
   then `$ICSHANDLE`, then `"guest"` if omitted.
 - `Password`: ICS password for `Username`. Falls back to
   `$FICSPASSWD`, then `$ICSPASSWD`. Leave it unset everywhere (here
   and both env vars) to log in as a guest.
-- `Engine`: command line used to launch the UCI engine, same idea as
-  `--engine` on the command line. `--engine`, if given, always takes
-  precedence over `Engine` here; if neither is set, it falls back to
+- `Engine`: command line used to launch the UCI engine, e.g.
+  `"./yourengine"` or `"/path/to/engine --some-flag"`. Falls back to
   the literal command `engine` (i.e. an executable named `engine` on
-  `$PATH`).
+  `$PATH`) if omitted.
 - `Kibitz`: `"Yes"` or `"No"` (case/whitespace insensitive), whether to
   whisper search stats after each move - see "Kibitzing search stats"
   below. Defaults to `"Yes"` if omitted.
-- `ColorBoard`: `"Yes"` or `"No"` (case/whitespace insensitive),
-  whether the console board is ANSI-colored (highlighting the previous
-  move's from/to squares). Defaults to `"Yes"` if omitted. This also
-  gates whether the screen-clearing escape below is sent at all: `"No"`
-  means "this terminal can't handle ANSI, period", not just the
-  highlighting, so with `"No"` the console gets a plain redraw with no
-  escape codes whatsoever - useful for a dumb terminal or when
-  redirecting output to a file/log.
-- `DisplayBoard`: `"True"` or `"False"` (case/whitespace insensitive,
-  same as `ColorBoard`/`Kibitz`). When `"False"`, the console board is
-  never printed at all. Defaults to `"True"` if omitted. When the
-  board is displayed and `ColorBoard` is `"Yes"`, the screen is
-  cleared (via an ANSI escape) right before each redraw, so the latest
-  position replaces the previous one instead of scrolling.
+- `ColorBoard`: `"Yes"` or `"No"` (case/whitespace insensitive). The
+  console board is always printed after every move; this only picks
+  its style. With `"Yes"`, the previous move's from/to squares are
+  highlighted with ANSI colors and the screen is cleared before each
+  redraw, so the latest position replaces the previous one instead of
+  scrolling. With `"No"` (the default when omitted, or for any value
+  other than `"Yes"`), the board is plain ASCII with no escape codes
+  at all - safe for any terminal, or when redirecting output to a
+  file/log.
   Just above the board, a short header is printed:
   ```
   White: Erebus  Black: SomeHandle
@@ -163,8 +202,8 @@ config.json); set it to `"No"` to turn it off.
 
 | Module | Responsibility | Replaces (original) |
 |---|---|---|
-| `config.rs` | CLI args + JSON config file (ICS connection, engine options, book) | `argparser.c` |
-| `ics.rs` | Raw TCP connection to the ICS, telnet IAC stripping, line splitting | `net.c` (`OpenTCP`, `SendToIcs`, `ProcessRawInput`) |
+| `config.rs` | CLI args + JSON config file (ICS connection, display/timeseal settings, engine options, book) | `argparser.c` |
+| `ics.rs` | TCP connection to the ICS: optional timeseal v1 encoding and ping replies, telnet IAC stripping, line splitting, `--debug` transcript | `net.c` (`OpenTCP`, `SendToIcs`, `ProcessRawInput`) |
 | `board.rs` | Parses `style 12` board lines into a `Style12` struct and converts to FEN | `board.c` (`ParseBoard`, `BoardToFen`) |
 | `engine.rs` | Spawns the engine subprocess, does the UCI handshake (`uci`/`uciok`, `isready`/`readyok`), sends `position`/`go`, parses `bestmove` | `computer.c` (`StartComputer`, `SendMoveToComputer`, `ProcessComputerLine`) — protocol swapped from xboard/CECP to UCI |
 | `app.rs` | Ties it together: login sequence, main event loop reacting to `<12>` lines | `main.c` (login block) + the `ProcessIcsLine`/`ProcessComputerLine` dispatch |
