@@ -58,7 +58,13 @@ impl App {
         let handle = config_file.resolve_username();
         let password = config_file.resolve_password();
 
-        let mut ics = IcsConn::connect(&host, port).await?;
+        let mut ics = IcsConn::connect(
+            &host,
+            port,
+            config.debug.as_deref(),
+            config_file.resolve_timeseal(),
+        )
+        .await?;
 
         info!("Connecting to {}:{} as {}", host, port, handle);
 
@@ -67,7 +73,7 @@ impl App {
         // blank lines through any guest prompts.
         ics.send(&handle).await?;
         if let Some(pw) = &password {
-            ics.send(pw).await?;
+            ics.send_secret(pw).await?;
         } else {
             ics.send("").await?; // guest login / "press enter"
         }
@@ -253,7 +259,7 @@ impl App {
         self.last_kibitz = None;
     }
 
-    /// Combines the `Opponent`/`Move`/`Kibitz` header with the board
+    /// Combines the `White`/`Black`/`Move`/`Clock`/`Kibitz` header with the board
     /// render into what actually gets printed, prefixed with an ANSI
     /// "clear screen, cursor home" escape only when `ansi_ok` is true.
     /// Callers pass `self.color_board` for `ansi_ok`: if a terminal
@@ -306,17 +312,14 @@ impl App {
         // needing a separate ICS client observing it - unless
         // `DisplayBoard` turned board display off entirely.
         if self.display_board {
-            // Whichever of White/Black isn't us. Compared against
-            // `board.white_name`/`black_name` directly (not
-            // `self.we_are_white`) so this is correct even on the very
-            // first style12 line of a game.
-            let opponent = if board.white_name == self.handle {
-                &board.black_name
-            } else {
-                &board.white_name
-            };
-
-            let mut header = format!("Opponent: {opponent}\nMove: {}", board.last_move_verbose);
+            let mut header = format!(
+                "White: {}  Black: {}\nMove: {}\nClock: White {}  Black {}",
+                board.white_name,
+                board.black_name,
+                board.last_move_verbose,
+                format_clock(board.white_time_ms),
+                format_clock(board.black_time_ms)
+            );
             if let Some(kibitz) = &self.last_kibitz {
                 header.push_str(&format!("\nKibitz: {kibitz}"));
             }
@@ -486,6 +489,20 @@ fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<String> {
     rx
 }
 
+/// Remaining clock time as "m:ss", or "h:mm:ss" from an hour up.
+/// Style12 clocks can go negative when a player overstays their time
+/// before the flag is called, so keep the sign rather than hiding it.
+fn format_clock(ms: i64) -> String {
+    let sign = if ms < 0 { "-" } else { "" };
+    let secs = ms.abs() / 1000;
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 {
+        format!("{sign}{h}:{m:02}:{s:02}")
+    } else {
+        format!("{sign}{m}:{s:02}")
+    }
+}
+
 /// True for the `>` prompt's own quit command - "quit" or "exit",
 /// case-insensitive, with no extra arguments. Deliberately exact (not
 /// just a prefix check) so it can't misfire on an ICS command that
@@ -556,8 +573,8 @@ mod tests {
 
     #[test]
     fn board_frame_prefixes_clear_screen_when_ansi_ok() {
-        let frame = App::board_frame("Opponent: bob", "  +---+", true);
-        assert_eq!(frame, "\x1B[2J\x1B[1;1HOpponent: bob\n\n  +---+");
+        let frame = App::board_frame("White: alice  Black: bob", "  +---+", true);
+        assert_eq!(frame, "\x1B[2J\x1B[1;1HWhite: alice  Black: bob\n\n  +---+");
     }
 
     #[test]
@@ -566,8 +583,8 @@ mod tests {
         // all, not just the square-highlighting codes - so the
         // clear-screen escape must be left out too, or the console
         // never actually becomes free of ANSI codes.
-        let frame = App::board_frame("Opponent: bob", "  +---+", false);
-        assert_eq!(frame, "Opponent: bob\n\n  +---+");
+        let frame = App::board_frame("White: alice  Black: bob", "  +---+", false);
+        assert_eq!(frame, "White: alice  Black: bob\n\n  +---+");
         assert!(!frame.contains('\x1B'));
     }
 
@@ -628,6 +645,15 @@ mod tests {
     #[test]
     fn ignores_non_challenge_lines() {
         assert_eq!(parse_challenge_name("fics% hello there"), None);
+    }
+
+    #[test]
+    fn formats_clock_times() {
+        assert_eq!(format_clock(0), "0:00");
+        assert_eq!(format_clock(65_000), "1:05");
+        assert_eq!(format_clock(300_000), "5:00");
+        assert_eq!(format_clock(3_725_000), "1:02:05");
+        assert_eq!(format_clock(-3_000), "-0:03");
     }
 
     #[test]

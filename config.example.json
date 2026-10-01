@@ -7,6 +7,7 @@
   "Kibitz": "Yes",
   "ColorBoard": "Yes",
   "DisplayBoard": "True",
+  "Timeseal": "Yes",
   "engine_options": {
     "Hash": "1024",
     "Threads": "4",

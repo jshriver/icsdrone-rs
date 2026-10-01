@@ -1,6 +1,6 @@
 [package]
 name = "icsdrone-rs"
-version = "1.0.5"
+version = "2.0.1"
 edition = "2024"
 description = "An ICS <-> UCI chess engine bridge"
 

@@ -48,6 +48,12 @@ pub struct Config {
     /// malformed.
     #[arg(long, default_value = "config.json")]
     pub config: PathBuf,
+
+    /// Append a raw transcript of everything sent to and received from
+    /// the ICS to this file (timestamped, control bytes escaped). The
+    /// password is masked, so the log is safe to share.
+    #[arg(long, value_name = "FILE")]
+    pub debug: Option<PathBuf>,
 }
 
 /// Whether to announce search stats after each move as
@@ -104,6 +110,7 @@ impl KibitzMode {
 ///   "Kibitz": "Yes",
 ///   "ColorBoard": "Yes",
 ///   "DisplayBoard": "True",
+///   "Timeseal": "Yes",
 ///   "engine_options": {
 ///     "Hash": "1024",
 ///     "Threads": "4",
@@ -139,6 +146,12 @@ impl KibitzMode {
 /// when "False", the board is never printed at all, regardless of
 /// `ColorBoard`. Accepts "True"/"False" in any case or spacing;
 /// defaults to "True" if absent - see `resolve_display_board`.
+///
+/// `Timeseal` turns on timeseal v1 encoding of everything we send, so
+/// the server charges us for thinking time only, not network lag.
+/// "Yes"/"No" like `Kibitz`; defaults to "No", since a server without
+/// timeseal support would read the encoded lines as garbage - see
+/// `resolve_timeseal`.
 ///
 /// Keys/values in `engine_options` are sent to the engine as-is via
 /// `setoption name <k> value <v>`, so any option the engine supports
@@ -192,6 +205,10 @@ pub struct ConfigFile {
     /// `resolve_display_board`.
     #[serde(default, rename = "DisplayBoard")]
     pub display_board: Option<String>,
+
+    /// Whether to timeseal-encode our output - see `resolve_timeseal`.
+    #[serde(default, rename = "Timeseal")]
+    pub timeseal: Option<String>,
 
     #[serde(default)]
     pub engine_options: BTreeMap<String, String>,
@@ -325,6 +342,16 @@ impl ConfigFile {
             Some(s) => !s.trim().eq_ignore_ascii_case("false"),
             None => true,
         }
+    }
+
+    /// Whether to speak timeseal: `Timeseal` from config.json. Only an
+    /// explicit "Yes" (any case/spacing) turns it on - unlike the
+    /// display options, guessing wrong here breaks the connection, so
+    /// absent or unrecognized values mean plain text.
+    pub fn resolve_timeseal(&self) -> bool {
+        self.timeseal
+            .as_deref()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("yes"))
     }
 
     /// The full set of UCI options to send to the engine at startup:
@@ -526,6 +553,16 @@ mod tests {
         let mut cfg = ConfigFile::default();
         cfg.kibitz = Some("banana".to_string());
         assert_eq!(cfg.resolve_kibitz(), KibitzMode::Off);
+    }
+
+    #[test]
+    fn resolve_timeseal_only_on_for_explicit_yes() {
+        let mut cfg = ConfigFile::default();
+        assert!(!cfg.resolve_timeseal());
+        for (s, want) in [("Yes", true), (" yEs ", true), ("No", false), ("banana", false)] {
+            cfg.timeseal = Some(s.to_string());
+            assert_eq!(cfg.resolve_timeseal(), want, "input was {s:?}");
+        }
     }
 
     #[test]

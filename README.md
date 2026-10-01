@@ -59,6 +59,7 @@ and an optional opening book:
   "Kibitz": "Yes",
   "ColorBoard": "Yes",
   "DisplayBoard": "True",
+  "Timeseal": "Yes",
   "engine_options": {
     "Hash": "1024",
     "Threads": "4",
@@ -101,16 +102,26 @@ and an optional opening book:
   position replaces the previous one instead of scrolling.
   Just above the board, a short header is printed:
   ```
-  Opponent: SomeHandle
+  White: Erebus  Black: SomeHandle
   Move: P/e2-e4
+  Clock: White 4:52  Black 4:58
   Kibitz: depth=17 score=1.87 time=8.96 node=17234760 nps=1923522 pv=...
   ```
-  `Opponent` and `Move` come from the current game's style12 line;
+  The `White`/`Black` names, `Move` and `Clock` (each side's
+  remaining time as of that move) come from the current game's
+  style12 line;
   `Kibitz` is the most recent search-stats line from our own last
   move (see "Kibitzing search stats" below) and is only shown once
   we've made at least one move in the game - it's carried over from
   the previous board redraw and cleared at the start of each new
   game.
+- `Timeseal`: `"Yes"` or `"No"` (case/whitespace insensitive).
+  When `"Yes"`, everything sent to the server is timeseal v1 encoded,
+  so the server charges our clock for thinking time only - not for
+  time our moves spend stuck on a slow or lossy network. The server's
+  `[G]` keepalive pings are answered automatically. Defaults to
+  `"No"` if omitted, since a server without timeseal support can't
+  read the encoded lines; nightmare-chess.nl:5000 supports it.
 - `engine_options`: any option name the engine supports works here,
   not just Hash/Threads/SyzygyPath - sent to the engine as-is via
   `setoption name <k> value <v>`. `Ponder`, `OwnBook`, and `NNUE` are
