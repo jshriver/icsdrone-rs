@@ -25,9 +25,10 @@ use crate::board::{Relation, Style12};
 use crate::engine::EngineInfo;
 use crate::pgn::record_move;
 
-/// Oldest console lines are dropped past this, so a bot left running
-/// for days doesn't grow without bound.
-const MAX_CONSOLE_LINES: usize = 2000;
+/// Oldest console lines are dropped past this. Kept small: the console
+/// is laid out in full on every frame, and a long scrollback costs CPU
+/// the engine could be using.
+const MAX_CONSOLE_LINES: usize = 100;
 
 // Board colors: the average light/dark square colors of Lichess's
 // "blue3" board (its textured image isn't bundled, just these colors).
@@ -327,9 +328,18 @@ impl eframe::App for GuiApp {
 
         egui::CentralPanel::default().show(ui, |ui| board_area(ui, &state));
 
-        // Keep the running clock ticking.
-        if state.board.is_some() && state.game_over.is_none() {
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        // Keep the running clock ticking: redraw just as its shown
+        // second changes, rather than many times a second - every frame
+        // costs CPU the engine could be using. Input and new boards
+        // still redraw straight away.
+        if state.game_over.is_none() {
+            if let Some((board, _)) = &state.board {
+                let (white, black) = live_clocks(&state);
+                let running = if board.to_move_white { white } else { black };
+                if let Some(ms) = running {
+                    ui.ctx().request_repaint_after(until_clock_ticks(ms));
+                }
+            }
         }
     }
 }
@@ -691,6 +701,21 @@ fn board_area(ui: &mut egui::Ui, state: &GuiState) {
 
 /// Both clocks, with the side to move's clock counting down since its
 /// board arrived (until the game ends).
+/// How long until a running clock showing `ms` displays a different
+/// second (`format_clock` drops the milliseconds), plus a few ms so the
+/// redraw lands just after the change rather than just before it.
+fn until_clock_ticks(ms: i64) -> Duration {
+    let into_second = ms.unsigned_abs() % 1000;
+    let wait = if ms > 0 {
+        // Counting down: the shown second drops once the remainder runs out.
+        if into_second == 0 { 1000 } else { into_second }
+    } else {
+        // At or past zero the magnitude grows: next whole second up.
+        1000 - into_second
+    };
+    Duration::from_millis(wait + 5)
+}
+
 fn live_clocks(state: &GuiState) -> (Option<i64>, Option<i64>) {
     let Some((board, received)) = &state.board else {
         return (None, None);
@@ -963,6 +988,16 @@ mod tests {
         assert_eq!(chart_range(&points(&[65.34])), 100.0);
         // Mates don't stretch the scale.
         assert_eq!(chart_range(&points(&[3.0, f32::INFINITY])), 5.0);
+    }
+
+    #[test]
+    fn redraws_when_the_shown_second_changes() {
+        // 4:59.250 shows 4:59 until 250ms from now.
+        assert_eq!(until_clock_ticks(299_250), Duration::from_millis(255));
+        // Exactly on a second: a full second until the next change.
+        assert_eq!(until_clock_ticks(299_000), Duration::from_millis(1005));
+        // Overstayed (negative): -0:01.300 becomes -0:02 in 700ms.
+        assert_eq!(until_clock_ticks(-1_300), Duration::from_millis(705));
     }
 
     #[test]
