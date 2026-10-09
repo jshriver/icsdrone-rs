@@ -698,7 +698,7 @@ fn board_area(ui: &mut egui::Ui, state: &GuiState) {
     let bar_height = 44.0;
     let avail = ui.available_size();
     // Room either side of the centered board for the material column.
-    let size = (avail.x - 2.0 * MATERIAL_COLUMN)
+    let size = (avail.x / (1.0 + 2.0 * MATERIAL_COLUMN))
         .min(avail.y - 2.0 * bar_height - 16.0)
         .max(160.0);
 
@@ -715,10 +715,12 @@ fn board_area(ui: &mut egui::Ui, state: &GuiState) {
         // Lichess-style material difference to the right of the board,
         // each side's by its own end of the board.
         if let Some(board) = board {
-            let x = board_rect.right() + 8.0;
-            paint_material(ui, Pos2::new(x, board_rect.top() + 4.0), &board.rows, top.2);
-            let bottom_y = board_rect.bottom() - MATERIAL_ICON - 4.0;
-            paint_material(ui, Pos2::new(x, bottom_y), &board.rows, bottom.2);
+            let icon = board_rect.width() / 8.0 * MATERIAL_ICON;
+            let x = board_rect.right() + icon * 0.4;
+            let top_y = board_rect.top() + icon * 0.2;
+            paint_material(ui, Pos2::new(x, top_y), &board.rows, top.2, icon);
+            let bottom_y = board_rect.bottom() - icon * 1.2;
+            paint_material(ui, Pos2::new(x, bottom_y), &board.rows, bottom.2, icon);
         }
     });
 }
@@ -832,36 +834,58 @@ fn material_edge(rows: &[String; 8], white: bool) -> (Vec<u8>, i32) {
     (pieces, points.max(0))
 }
 
-/// Width kept free beside the board for the material difference.
-const MATERIAL_COLUMN: f32 = 110.0;
-/// Size of its piece icons.
-const MATERIAL_ICON: f32 = 18.0;
+/// Width kept free either side of the board for the material
+/// difference, as a fraction of the board's width.
+const MATERIAL_COLUMN: f32 = 0.3;
+/// Size of its piece icons, as a fraction of a board square.
+const MATERIAL_ICON: f32 = 0.5;
+/// Behind the material icons: the board's light-square blue (as for
+/// book moves), on which both colors of piece show up, whatever the
+/// window's theme.
+const MATERIAL_STRIP: Color32 = LIGHT_SQUARE;
 
 /// Paint one side's material difference in a row starting at `at`
 /// (its top-left): small piece icons, then "+N" when that side is
 /// ahead. Pieces of one kind overlap a little, as on Lichess.
-fn paint_material(ui: &egui::Ui, at: Pos2, rows: &[String; 8], white: bool) {
+/// `icon` is the icons' size in points.
+fn paint_material(ui: &egui::Ui, at: Pos2, rows: &[String; 8], white: bool, icon: f32) {
     let (pieces, points) = material_edge(rows, white);
+    // Where each icon goes, left to right.
+    let mut xs = Vec::with_capacity(pieces.len());
     let mut x = at.x;
     for (i, &piece) in pieces.iter().enumerate() {
         if i > 0 {
             let same = pieces[i - 1] == piece;
-            x += if same { MATERIAL_ICON * 0.55 } else { MATERIAL_ICON + 2.0 };
+            x += if same { icon * 0.55 } else { icon * 1.1 };
         }
+        xs.push(x);
+    }
+    if !pieces.is_empty() {
+        // On a light-square blue strip - straight on the window background,
+        // white pieces vanish in the light theme and black ones in
+        // the dark.
+        let pad = icon * 0.15;
+        let strip = Rect::from_min_max(
+            Pos2::new(at.x - pad, at.y - pad),
+            Pos2::new(x + icon + pad, at.y + icon + pad),
+        );
+        ui.painter().rect_filled(strip, pad, MATERIAL_STRIP);
+    }
+    for (&piece, &x) in pieces.iter().zip(&xs) {
         if let Some(image) = piece_image(piece) {
-            let rect = Rect::from_min_size(Pos2::new(x, at.y), Vec2::splat(MATERIAL_ICON));
+            let rect = Rect::from_min_size(Pos2::new(x, at.y), Vec2::splat(icon));
             egui::Image::new(image).paint_at(ui, rect);
         }
     }
     if points > 0 {
         if !pieces.is_empty() {
-            x += MATERIAL_ICON + 4.0;
+            x += icon * 1.3;
         }
         ui.painter().text(
-            Pos2::new(x, at.y + MATERIAL_ICON / 2.0),
+            Pos2::new(x, at.y + icon / 2.0),
             egui::Align2::LEFT_CENTER,
             format!("+{points}"),
-            FontId::proportional(14.0),
+            FontId::proportional((icon * 0.7).max(12.0)),
             ui.visuals().weak_text_color(),
         );
     }
