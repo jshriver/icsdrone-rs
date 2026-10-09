@@ -306,6 +306,15 @@ impl eframe::App for GuiApp {
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
         }
+        // T switches between light and dark, likewise.
+        let toggle_theme = !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.modifiers.is_none() && i.key_pressed(egui::Key::T));
+        if toggle_theme {
+            ctx.set_theme(match ctx.theme() {
+                egui::Theme::Dark => egui::Theme::Light,
+                egui::Theme::Light => egui::Theme::Dark,
+            });
+        }
 
         egui::Panel::bottom("status")
             .resizable(false)
@@ -484,6 +493,9 @@ fn status_bar(ui: &mut egui::Ui, state: &GuiState) {
                 }
             }
             ui.label(if state.timeseal { "Timeseal on" } else { "Timeseal off" });
+            ui.separator();
+            // ☀/🌙: switch between light and dark (also the T key).
+            egui::widgets::global_theme_preference_switch(ui);
         });
     });
 }

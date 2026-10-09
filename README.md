@@ -122,7 +122,9 @@ the terminal (Windows, Linux and macOS):
 - **Status bar**: login state (or the server's login error), progress
   while a large opening book loads or while reconnecting, timeseal,
   and the current game number.
-- **F** toggles fullscreen (when you're not typing in the console).
+- **F** toggles fullscreen and **T** switches between light and dark
+  (when you're not typing in the console). The ☀/🌙 button in the
+  status bar switches the theme too.
 
 The window is the whole interface, so it runs as a standalone app:
 nothing is printed to the terminal and the `>` prompt is off (use the
@@ -144,7 +146,8 @@ sometimes loses the Wayland connection (`/run/user/<uid>` goes
 missing); the window then falls back to X11 automatically. If the
 window can't open at all, the reason is printed in the terminal.
 
-The window follows the system's light/dark setting.
+The window starts in the system's light/dark setting; the ☀/🌙
+button or **T** switches it for the rest of the session.
 
 ### Config file
 
