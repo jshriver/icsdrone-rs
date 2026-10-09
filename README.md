@@ -9,6 +9,13 @@ A Rust rewrite inspired by icsdrone that bridges an Internet Chess Server to a c
 cargo run --release
 ```
 
+The release build uses thin LTO. For quicker builds while testing,
+there's also an optimized profile without LTO:
+
+```
+cargo build --profile quick     # -> target/quick/icsdrone-rs
+```
+
 Everything - ICS connection, engine, display (terminal board or GUI),
 timeseal, opening book, saving games - is configured in
 `config.json`; see "Config file" below. Copy `config.example.json` to
@@ -79,7 +86,10 @@ Once running, a `>` prompt reads commands from stdin:
 Commands are handled even while the engine is thinking: ICS commands
 are sent right away, and `quit` stops the search and logs off. Only
 `engine ...` has to wait - it's refused with a message until the
-current move is played.
+current move is played (or, with pondering on, until the game ends).
+
+Handy ICS commands during a game: `resign`, `draw` (offer a draw) and
+`abort` (request an abort).
 
 Logs go to stderr so they don't interleave with the prompt.
 
@@ -92,15 +102,27 @@ the terminal (Windows, Linux and macOS):
   your side at the bottom.
 - **Player bars** with names and clocks; the side to move's clock
   counts down live and turns red under 10 seconds.
+- **Resign** button above the engine panel during a game. It asks
+  for confirmation first, then sends FICS's `resign`.
 - **Engine** panel: best move, score, depth, time, nodes, NPS and the
   principal variation, in SAN with move numbers (`39... e3 40. Rd3`).
   Book moves are shown as such.
+- **Score** chart of the engine's evaluation after each of our moves,
+  from the bot's point of view (above the line = the bot is ahead,
+  matching the engine panel). The scale grows with the scores (±1,
+  ±2, ±5, ±10, ±20, ...); mates sit on the edge. Hover a point for its
+  move and exact score.
 - **Moves** list for the current game, with the result once it ends.
+  The bot's book moves (from `Book` or the engine's own book) are
+  highlighted in light blue.
 - **Console** showing server output, our commands, kibitz and bot
-  events, with an input line that takes the same commands as the `>`
-  prompt (Up/Down recalls earlier ones).
-- **Status bar**: login state (or the server's login error),
-  timeseal, and the current game number.
+  events, each line timestamped to the millisecond, with an input
+  line that takes the same commands as the `>` prompt (Up/Down
+  recalls earlier ones). Bare `fics%` prompt lines are left out.
+- **Status bar**: login state (or the server's login error), progress
+  while a large opening book loads or while reconnecting, timeseal,
+  and the current game number.
+- **F** toggles fullscreen (when you're not typing in the console).
 
 The window is the whole interface, so it runs as a standalone app:
 nothing is printed to the terminal and the `>` prompt is off (use the
@@ -117,7 +139,12 @@ the working directory, so when launching it from a desktop shortcut,
 set the shortcut's "Start in" folder to the one holding `config.json`.
 
 The window needs a graphical desktop: on Windows 11 under WSL it opens
-through WSLg, and on a headless server leave `GUI` at `"No"`.
+through WSLg, and on a headless server leave `GUI` at `"No"`. WSL
+sometimes loses the Wayland connection (`/run/user/<uid>` goes
+missing); the window then falls back to X11 automatically. If the
+window can't open at all, the reason is printed in the terminal.
+
+The window follows the system's light/dark setting.
 
 ### Config file
 
@@ -253,6 +280,11 @@ are silently ignored.
   has the engine think on the opponent's time (`go ponder`) about the
   reply it expects, sends `ponderhit` if the opponent plays it, and
   `stop`s and searches afresh if they don't.
+  With `"OwnBook": "true"` the engine plays from its own opening book.
+  UCI has no message for "this was a book move", so the bot infers it:
+  a `bestmove` with no search behind it, or an `info string` saying
+  "book move". Those moves are shown as book moves in the GUI, written
+  as `{book}` in the PGN, and not kibitzed.
 - `Book`: path (absolute, or relative to the working directory the
   process was started from) to a Polyglot (`.bin`) opening book. When
   set, it's checked for a move before the engine is asked to search
@@ -280,18 +312,47 @@ whisper depth=17 score=1.87 time=8.96 node=17234760 nps=1923522 pv=e2e4 e7e5 g1f
 Field names/units match what the engine itself prints in its `info`
 line (score in pawns, time in seconds, mate scores as `M3`/`-M3`), just
 using the deepest completed iteration rather than every depth along the
-way. On by default (`Kibitz` defaults to `"Yes"` if omitted from
-config.json); set it to `"No"` to turn it off.
+way. Book moves aren't kibitzed, since there's no search to report. On
+by default (`Kibitz` defaults to `"Yes"` if omitted from config.json);
+set it to `"No"` to turn it off.
+
+### Playing a game
+
+- **Full move history.** UCI engines don't remember earlier moves, so
+  each turn the engine gets the game's starting position plus every
+  move since (`position fen <start> moves e2e4 e7e5 ...`), not just
+  the current board. That's how it sees, and avoids, threefold
+  repetition. Takebacks and games joined midway are handled.
+- **Illegal move safety net.** If FICS ever rejects one of the bot's
+  moves, the bot searches again from the current board instead of
+  letting its clock run out. It does this once per move.
+
+### Flaky connections
+
+- **TCP keepalive.** After 30 seconds without traffic, the operating
+  system probes the connection every 10 seconds. That keeps routers
+  from dropping a quiet connection, and a dead one is noticed in
+  about a minute rather than hours. FICS doesn't see the probes.
+- **Automatic reconnect.** If the connection drops, the bot doesn't
+  exit: it stops the engine, then reconnects and logs back in,
+  retrying after 5s, 10s, 30s and then every 60s. The console and
+  status bar show each attempt, and `quit` still works while it
+  waits.
+- **Resuming games.** FICS adjourns a game when a player drops. After
+  reconnecting, the bot sends `resume` to ask the opponent to carry
+  on. With `SavePGN`, the moves before the drop aren't saved; the
+  recording restarts from the resumed position.
 
 ## Architecture
 
 | Module | Responsibility | Replaces (original) |
 |---|---|---|
 | `config.rs` | CLI args + JSON config file (ICS connection, display/timeseal settings, engine options, book) | `argparser.c` |
-| `ics.rs` | TCP connection to the ICS: optional timeseal v1 encoding and ping replies, telnet IAC stripping, line splitting, `--debug` transcript | `net.c` (`OpenTCP`, `SendToIcs`, `ProcessRawInput`) |
-| `board.rs` | Parses `style 12` board lines into a `Style12` struct and converts to FEN | `board.c` (`ParseBoard`, `BoardToFen`) |
-| `engine.rs` | Spawns the engine subprocess, does the UCI handshake (`uci`/`uciok`, `isready`/`readyok`), sends `position`/`go`, parses `bestmove` | `computer.c` (`StartComputer`, `SendMoveToComputer`, `ProcessComputerLine`) — protocol swapped from xboard/CECP to UCI |
-| `app.rs` | Ties it together: login sequence, main event loop reacting to `<12>` lines and typed commands | `main.c` (login block) + the `ProcessIcsLine`/`ProcessComputerLine` dispatch |
+| `ics.rs` | TCP connection to the ICS: TCP keepalive, optional timeseal v1 encoding and ping replies, telnet IAC stripping, line splitting, `--debug` transcript | `net.c` (`OpenTCP`, `SendToIcs`, `ProcessRawInput`) |
+| `board.rs` | Parses `style 12` board lines into a `Style12` struct, converts to FEN and the last move to UCI, and draws the FICS style 1 terminal board | `board.c` (`ParseBoard`, `BoardToFen`) |
+| `history.rs` | The game's moves in UCI form since its first board, for `position fen ... moves ...` | `SendMovesToComputer` bookkeeping |
+| `engine.rs` | Spawns the engine subprocess, does the UCI handshake (`uci`/`uciok`, `isready`/`readyok`), sends `position`/`go`/`go ponder`/`ponderhit`, parses `bestmove` and spots book moves | `computer.c` (`StartComputer`, `SendMoveToComputer`, `ProcessComputerLine`) — protocol swapped from xboard/CECP to UCI |
+| `app.rs` | Ties it together: login and reconnect, main event loop reacting to `<12>` lines and typed commands, pondering | `main.c` (login block) + the `ProcessIcsLine`/`ProcessComputerLine` dispatch |
 | `gui.rs` | The optional desktop window (egui/eframe): reads state the bot publishes, sends typed commands back | (new) |
 | `san.rs` | UCI -> SAN conversion for the engine panel (via shakmaty) | (new) |
 | `pgn.rs` | Records our games' moves and appends finished games to the `SavePGN` file | (new) |

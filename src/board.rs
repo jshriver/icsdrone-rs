@@ -418,21 +418,27 @@ impl Style12 {
         if verbose.eq_ignore_ascii_case("o-o-o") {
             return Some(format!("e{rank}c{rank}"));
         }
-        let (_, squares) = verbose.split_once('/')?;
+        let (piece, squares) = verbose.split_once('/')?;
         let (from, rest) = squares.split_once('-')?;
         let to = rest.get(..2)?;
         if from.len() != 2 {
             return None;
         }
         parse_square(from)?;
-        parse_square(to)?;
-        // "=Q" for a promotion; anything else after the square (e.g.
-        // an "ep" marker) isn't part of the UCI move.
-        let promotion = rest[2..]
-            .strip_prefix('=')
-            .and_then(|p| p.chars().next())
-            .map(|p| p.to_ascii_lowercase().to_string())
-            .unwrap_or_default();
+        let (to_row, to_col) = parse_square(to)?;
+        // A pawn reaching the last rank promoted: to whatever stands on
+        // that square now. The board is used rather than an "=Q" suffix,
+        // which FICS doesn't reliably send - and "a7a8" without its
+        // piece makes engines drop the rest of the move list.
+        let promotion = if piece.eq_ignore_ascii_case("p") && (to_row == 0 || to_row == 7) {
+            let promoted = self.rows[to_row].chars().nth(to_col)?;
+            if !"qrbnQRBN".contains(promoted) {
+                return None;
+            }
+            promoted.to_ascii_lowercase().to_string()
+        } else {
+            String::new()
+        };
         Some(format!("{from}{to}{promotion}"))
     }
 }
@@ -572,8 +578,18 @@ mod tests {
         let mut s12 = Style12::parse(line).unwrap();
         assert_eq!(s12.last_move_uci().as_deref(), Some("e2e4"));
 
+        // Promotions take the piece from the board, with or without
+        // FICS's "=Q" suffix.
+        s12.rows[0] = "rnbqQbnr".to_string();
         s12.last_move_verbose = "P/e7-e8=Q".to_string();
         assert_eq!(s12.last_move_uci().as_deref(), Some("e7e8q"));
+        s12.last_move_verbose = "P/e7-e8".to_string();
+        assert_eq!(s12.last_move_uci().as_deref(), Some("e7e8q"));
+        s12.rows[0] = "rnbqNbnr".to_string();
+        assert_eq!(s12.last_move_uci().as_deref(), Some("e7e8n"));
+        // No promoted piece where it should be: unknown, not a guess.
+        s12.rows[0] = "rnbq-bnr".to_string();
+        assert_eq!(s12.last_move_uci(), None);
         s12.last_move_verbose = "P/d5-c6ep".to_string();
         assert_eq!(s12.last_move_uci().as_deref(), Some("d5c6"));
 

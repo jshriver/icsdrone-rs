@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -28,8 +28,29 @@ struct Ponder {
     moves: Vec<String>,
 }
 
+/// How to (re)connect and log in to the ICS.
+struct Login {
+    host: String,
+    port: u16,
+    username: String,
+    password: Option<String>,
+    timeseal: bool,
+    /// `--debug` transcript file, reopened (appended to) on reconnect.
+    debug_log: Option<PathBuf>,
+}
+
+/// Waits between reconnect attempts after the connection drops; the
+/// last one repeats until we're back.
+const RECONNECT_DELAYS: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
 pub struct App {
     ics: IcsConn,
+    login: Login,
     engine: UciEngine,
     /// Polyglot opening book, if one was configured. Consulted before
     /// the engine each turn in `handle_style12`.
@@ -80,6 +101,12 @@ pub struct App {
     /// base FEN + moves) it's pondering, i.e. after our move and the
     /// opponent's expected reply.
     ponder: Option<Ponder>,
+    /// The style12 line of the board we're to move on, kept until we've
+    /// moved, so a move FICS rejects can be searched again.
+    my_turn_line: Option<String>,
+    /// Ply we already re-searched after an illegal move, so a second
+    /// rejection doesn't loop.
+    illegal_retry_ply: Option<usize>,
     /// The latest "Creating: ..." line, picked up by the next game's
     /// PGN for its ratings and game type.
     announcement: Option<GameAnnouncement>,
@@ -91,48 +118,16 @@ impl App {
         config_file: &ConfigFile,
         gui: Option<Arc<GuiShared>>,
     ) -> Result<Self> {
-        let host = config_file.resolve_host();
-        let port = config_file.resolve_port();
-        let handle = config_file.resolve_username();
-        let password = config_file.resolve_password();
-        let timeseal = config_file.resolve_timeseal();
-
-        if let Some(gui) = &gui {
-            gui.update(|s| {
-                s.status = format!("Connecting to {host}:{port}…");
-                s.timeseal = timeseal;
-            });
-        }
-
-        let mut ics = IcsConn::connect(
-            &host,
-            port,
-            config.debug.as_deref(),
-            timeseal,
-        )
-        .await?;
-
-        info!("Connecting to {}:{} as {}", host, port, handle);
-
-        // Log in. Mirrors main()'s `SendToIcs("%s\n%s\n\n", handle, passwd)`.
-        // If no password was supplied we log in as guest and just send
-        // blank lines through any guest prompts.
-        ics.send(&handle).await?;
-        if let Some(pw) = &password {
-            ics.send_secret(pw).await?;
-        } else {
-            ics.send("").await?; // guest login / "press enter"
-        }
-        ics.send("").await?;
-
-        // Ask the server for machine-parseable board updates and quiet
-        // down chatter, same intent as the big SendToIcs(...) block in
-        // main.c, trimmed to what the MVP core loop needs.
-        ics.send(
-            "set style 12\nset shout 0\nset cshout 0\nset seek 0\nset width 240\n\
-             iset nowrap 1\niset movecase 1\n",
-        )
-        .await?;
+        let login = Login {
+            host: config_file.resolve_host(),
+            port: config_file.resolve_port(),
+            username: config_file.resolve_username(),
+            password: config_file.resolve_password(),
+            timeseal: config_file.resolve_timeseal(),
+            debug_log: config.debug.clone(),
+        };
+        let ics = open_ics(&login, gui.as_deref()).await?;
+        let (host, port, handle) = (login.host.clone(), login.port, login.username.clone());
 
         if !config_file.engine_options.is_empty() {
             info!(
@@ -191,6 +186,7 @@ impl App {
 
         Ok(App {
             ics,
+            login,
             engine,
             book,
             handle,
@@ -209,6 +205,8 @@ impl App {
             history: None,
             ponder_enabled,
             ponder: None,
+            my_turn_line: None,
+            illegal_retry_ply: None,
             announcement: None,
         })
     }
@@ -235,6 +233,21 @@ impl App {
         }
         self.commands = Some(cmd_rx);
 
+        // A dropped connection isn't the end: reconnect and carry on.
+        // Any other error still is.
+        loop {
+            match self.event_loop().await {
+                Err(e) if self.ics.is_dead() => self.reconnect(&e).await?,
+                result => return result,
+            }
+            if self.quit_requested {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Read ICS lines and typed commands until quit (`Ok`) or an error.
+    async fn event_loop(&mut self) -> Result<()> {
         loop {
             if self.quit_requested {
                 return Ok(());
@@ -331,6 +344,8 @@ impl App {
             notify(self.gui.as_deref(), &format!("Game ended: {}", line.trim()));
             self.stop_pondering().await;
             self.game_over(line);
+        } else if line.contains("Illegal move") {
+            self.retry_after_illegal_move().await?;
         } else if line.contains("no longer") && line.contains("observing") {
             // benign
         } else {
@@ -384,6 +399,8 @@ impl App {
         self.we_are_white = None;
         self.last_kibitz = None;
         self.history = None;
+        self.my_turn_line = None;
+        self.illegal_retry_ply = None;
     }
 
     /// The game we're playing has ended on `line` ("{Game N (...) ...}
@@ -528,8 +545,10 @@ impl App {
         }
 
         if !matches!(board.relation, Relation::PlayingMyMove) {
+            self.my_turn_line = None;
             return Ok(()); // opponent to move (or we just moved), nothing to do
         }
+        self.my_turn_line = Some(line.to_string());
 
         // The current board, for the book lookup and SAN display. The
         // engine instead gets the game's base position plus every move
@@ -692,6 +711,107 @@ impl App {
         Ok(())
     }
 
+    /// The ICS connection dropped (`error`). Stop the engine, then
+    /// reconnect and log back in, waiting longer between each failed
+    /// attempt, until it works or the operator quits. If we were in a
+    /// game, FICS will have adjourned it, so ask to resume it.
+    async fn reconnect(&mut self, error: &anyhow::Error) -> Result<()> {
+        warn!("ICS connection lost: {error:#}");
+        if let Some(gui) = &self.gui {
+            gui.update(|s| {
+                s.connected = false;
+                s.status = "Connection lost - reconnecting…".to_string();
+            });
+        }
+        notify(
+            self.gui.as_deref(),
+            &format!("Connection lost ({error:#}) - reconnecting"),
+        );
+        self.stop_pondering().await;
+        let was_playing = self.game_number.is_some();
+        self.reset_game();
+
+        for attempt in 0.. {
+            let delay = RECONNECT_DELAYS[attempt.min(RECONNECT_DELAYS.len() - 1)];
+            notify(
+                self.gui.as_deref(),
+                &format!("Reconnecting in {}s…", delay.as_secs()),
+            );
+            // Keep serving typed commands while we wait, so "quit"
+            // still works.
+            let sleep = tokio::time::sleep(delay);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    () = &mut sleep => break,
+                    cmd = next_command(&mut self.commands) => {
+                        echo_command(self.gui.as_deref(), &cmd);
+                        if is_quit_command(&cmd) {
+                            self.quit_requested = true;
+                            return Ok(());
+                        }
+                        notify(self.gui.as_deref(), "Not connected; command not sent.");
+                    }
+                }
+            }
+
+            match open_ics(&self.login, self.gui.as_deref()).await {
+                Ok(ics) => {
+                    self.ics = ics;
+                    let (host, port) = (&self.login.host, self.login.port);
+                    notify(self.gui.as_deref(), &format!("Reconnected to {host}:{port}"));
+                    if let Some(gui) = &self.gui {
+                        let status = format!("Connected to {host}:{port} as {}", self.handle);
+                        gui.update(|s| {
+                            s.connected = true;
+                            s.status = status;
+                        });
+                    }
+                    if was_playing {
+                        // FICS adjourns a game when a player drops;
+                        // this asks the opponent to carry on with it.
+                        notify(self.gui.as_deref(), "Asking to resume the adjourned game");
+                        self.ics.send("resume").await?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("reconnect failed: {e:#}");
+                    notify(self.gui.as_deref(), &format!("Reconnect failed: {e:#}"));
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    /// FICS rejected the move we just sent, and it's still our turn.
+    /// Rather than sit there until our flag falls, search again once
+    /// from the current board as a plain FEN - dropping the move
+    /// history, in case that's what led the engine astray.
+    async fn retry_after_illegal_move(&mut self) -> Result<()> {
+        let Some(line) = self.my_turn_line.clone() else {
+            return Ok(()); // not our move (e.g. a typed move was rejected)
+        };
+        let Ok(board) = Style12::parse(&line) else {
+            return Ok(());
+        };
+        if self.illegal_retry_ply == Some(board.ply()) {
+            warn!("FICS rejected our move again; not retrying");
+            if let Some(gui) = &self.gui {
+                gui.console(LineKind::Error, "FICS rejected our move again; not retrying.");
+            }
+            return Ok(());
+        }
+        self.illegal_retry_ply = Some(board.ply());
+        notify(
+            self.gui.as_deref(),
+            "FICS rejected our move - searching again from the current position",
+        );
+        self.stop_pondering().await;
+        self.history = None;
+        self.handle_style12(&line).await
+    }
+
     /// Stop a ponder search, if one is running (the game ended, or a
     /// new one started).
     async fn stop_pondering(&mut self) {
@@ -728,7 +848,18 @@ impl App {
             tokio::select! {
                 result = &mut search => return Ok(Some(result?)),
                 line = self.ics.read_line() => {
-                    let line = line?;
+                    let line = match line {
+                        Ok(line) => line,
+                        Err(e) => {
+                            // Connection lost mid-search: there's no
+                            // game to send the move to any more.
+                            drop(search);
+                            if let Err(e) = self.engine.stop().await {
+                                warn!("failed to abort engine search cleanly: {e}");
+                            }
+                            return Err(e);
+                        }
+                    };
                     if !line.trim().is_empty() && !line.contains("<12>") {
                         show_server_line(self.gui.as_deref(), &line);
                     }
@@ -777,6 +908,42 @@ impl App {
     pub async fn shutdown(self) -> Result<()> {
         self.engine.quit().await
     }
+}
+
+/// Connect to the ICS and log in. Mirrors main()'s `SendToIcs("%s\n%s\n\n",
+/// handle, passwd)`: with no password we log in as a guest and just send
+/// blank lines through any guest prompts. Used at startup and on every
+/// reconnect.
+async fn open_ics(login: &Login, gui: Option<&GuiShared>) -> Result<IcsConn> {
+    let (host, port) = (&login.host, login.port);
+    if let Some(gui) = gui {
+        gui.update(|s| {
+            s.status = format!("Connecting to {host}:{port}…");
+            s.timeseal = login.timeseal;
+        });
+    }
+
+    let mut ics =
+        IcsConn::connect(host, port, login.debug_log.as_deref(), login.timeseal).await?;
+
+    info!("Connecting to {}:{} as {}", host, port, login.username);
+    ics.send(&login.username).await?;
+    if let Some(pw) = &login.password {
+        ics.send_secret(pw).await?;
+    } else {
+        ics.send("").await?; // guest login / "press enter"
+    }
+    ics.send("").await?;
+
+    // Ask the server for machine-parseable board updates and quiet
+    // down chatter, same intent as the big SendToIcs(...) block in
+    // main.c, trimmed to what the MVP core loop needs.
+    ics.send(
+        "set style 12\nset shout 0\nset cshout 0\nset seek 0\nset width 240\n\
+         iset nowrap 1\niset movecase 1\n",
+    )
+    .await?;
+    Ok(ics)
 }
 
 /// Spawn a background task that prints a `> ` prompt, reads lines typed

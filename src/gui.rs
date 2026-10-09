@@ -36,9 +36,10 @@ const DARK_SQUARE: Color32 = Color32::from_rgb(0x56, 0x8a, 0xb6);
 const LAST_MOVE: Color32 = Color32::from_rgba_premultiplied(64, 82, 0, 105);
 const LOW_TIME: Color32 = Color32::from_rgb(0xe0, 0x40, 0x40);
 
-/// Scores beyond this many pawns (and forced mates) are drawn at the
-/// edge of the score chart, so one huge score doesn't flatten the rest.
-const SCORE_CAP: f32 = 10.0;
+/// Scores this big (in pawns) are really mates - some engines report a
+/// mate as e.g. "cp 799981" - so, like forced mates, they're drawn at
+/// the edge of the score chart rather than stretching its scale.
+const MATE_LIKE: f32 = 1000.0;
 const SCORE_CHART_HEIGHT: f32 = 140.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +144,8 @@ impl GuiState {
 pub struct ScorePoint {
     /// Ply of our move (1 = White's first move).
     pub ply: usize,
-    /// Pawns, clamped to `SCORE_CAP`; mates sit at the cap.
+    /// Pawns; infinite for mates (and `MATE_LIKE` scores), which the
+    /// chart draws at its edge.
     pub value: f32,
     /// As shown on hover: "+1.87", "-0.40", "M3", "-M5".
     pub label: String,
@@ -157,14 +159,19 @@ impl GuiState {
         let (value, label) = match (info.score_mate, info.score_cp) {
             (Some(mate), _) => {
                 if mate >= 0 {
-                    (SCORE_CAP, format!("M{mate}"))
+                    (f32::INFINITY, format!("M{mate}"))
                 } else {
-                    (-SCORE_CAP, format!("-M{}", -mate))
+                    (f32::NEG_INFINITY, format!("-M{}", -mate))
                 }
             }
             (None, Some(cp)) => {
                 let pawns = cp as f32 / 100.0;
-                (pawns.clamp(-SCORE_CAP, SCORE_CAP), format!("{pawns:+.2}"))
+                let value = if pawns.abs() >= MATE_LIKE {
+                    f32::INFINITY.copysign(pawns)
+                } else {
+                    pawns
+                };
+                (value, format!("{pawns:+.2}"))
             }
             (None, None) => return,
         };
@@ -172,6 +179,26 @@ impl GuiState {
         // A takeback can replay a ply; keep only the newest score for it.
         self.scores.retain(|p| p.ply < ply);
         self.scores.push(ScorePoint { ply, value, label });
+    }
+}
+
+/// The score chart's scale, in pawns either way from zero: the largest
+/// finite score rounded up to 1, 2 or 5 times a power of ten (at least
+/// 1), so it grows from ±1 through ±2, ±5, ±10, ±20, ...
+fn chart_range(scores: &[ScorePoint]) -> f32 {
+    let largest = scores
+        .iter()
+        .map(|p| p.value.abs())
+        .filter(|v| v.is_finite())
+        .fold(1.0_f32, f32::max);
+    let mut step = 1.0_f32;
+    loop {
+        for nice in [1.0, 2.0, 5.0] {
+            if largest <= nice * step {
+                return nice * step;
+            }
+        }
+        step *= 10.0;
     }
 }
 
@@ -562,13 +589,9 @@ fn score_chart(ui: &mut egui::Ui, scores: &[ScorePoint], we_are_white: bool) {
         return;
     }
 
-    // Vertical scale: the largest score so far, rounded up to a whole
-    // pawn (at least one), within the cap.
-    let range = scores
-        .iter()
-        .fold(1.0_f32, |m, p| m.max(p.value.abs()))
-        .ceil()
-        .min(SCORE_CAP);
+    // Vertical scale: grows with the largest score so far (mates aside,
+    // which sit on the edge), in round steps.
+    let range = chart_range(scores);
     let first = scores[0].ply as f32;
     let last = (scores[scores.len() - 1].ply as f32).max(first + 1.0);
     let inner = rect.shrink2(Vec2::new(6.0, 8.0));
@@ -576,7 +599,7 @@ fn score_chart(ui: &mut egui::Ui, scores: &[ScorePoint], we_are_white: bool) {
     let to_screen = |p: &ScorePoint| {
         Pos2::new(
             inner.left() + (p.ply as f32 - first) / (last - first) * inner.width(),
-            zero_y - p.value / range * inner.height() / 2.0,
+            zero_y - p.value.clamp(-range, range) / range * inner.height() / 2.0,
         )
     };
     let points: Vec<Pos2> = scores.iter().map(to_screen).collect();
@@ -909,16 +932,37 @@ mod tests {
     }
 
     #[test]
-    fn mates_and_big_scores_sit_at_the_cap() {
+    fn big_scores_are_kept_and_mates_sit_at_the_edge() {
         let mut state = GuiState::default();
         let black_to_move = board("B 4 1 1 1 1 0 7 a b 1 1 0 39 39 60 60 1 P/e2-e4 (0:00) e4 0 0 0");
         // We mate in 3.
         state.push_score(&black_to_move, &info(None, Some(3)));
-        assert_eq!((state.scores[0].value, state.scores[0].label.as_str()), (SCORE_CAP, "M3"));
-        // Replaying the same ply replaces its score.
+        assert_eq!((state.scores[0].value, state.scores[0].label.as_str()), (f32::INFINITY, "M3"));
+        // Replaying the same ply replaces its score; big scores stay.
         state.push_score(&black_to_move, &info(Some(-3615), None));
         assert_eq!(state.scores.len(), 1);
-        assert_eq!((state.scores[0].value, state.scores[0].label.as_str()), (-SCORE_CAP, "-36.15"));
+        assert_eq!((state.scores[0].value, state.scores[0].label.as_str()), (-36.15, "-36.15"));
+        // An engine's "cp 799981" mate counts as a mate.
+        state.push_score(&black_to_move, &info(Some(799_981), None));
+        assert_eq!((state.scores[0].value, state.scores[0].label.as_str()), (f32::INFINITY, "+7999.81"));
+    }
+
+    #[test]
+    fn chart_scale_grows_in_round_steps() {
+        let points = |values: &[f32]| -> Vec<ScorePoint> {
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, &value)| ScorePoint { ply: i + 1, value, label: String::new() })
+                .collect()
+        };
+        assert_eq!(chart_range(&points(&[0.3])), 1.0);
+        assert_eq!(chart_range(&points(&[0.3, -1.5])), 2.0);
+        assert_eq!(chart_range(&points(&[4.0, 10.0])), 10.0);
+        assert_eq!(chart_range(&points(&[12.95, 34.5])), 50.0);
+        assert_eq!(chart_range(&points(&[65.34])), 100.0);
+        // Mates don't stretch the scale.
+        assert_eq!(chart_range(&points(&[3.0, f32::INFINITY])), 5.0);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -34,6 +34,11 @@ const TIMESEAL_PING_LINE: &str = "[G]";
 /// terminals don't beep and the GUI console doesn't show a box.
 const BELL: char = '\x07';
 const TIMESEAL_PONG: &[u8] = b"\x029";
+/// TCP keepalive: after this long with nothing on the wire, the OS
+/// starts probing the connection...
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+/// ...this often, until the server answers or the OS gives up on it.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct IcsConn {
     stream: TcpStream,
@@ -45,6 +50,9 @@ pub struct IcsConn {
     /// Set when timeseal is on: the instant our timestamps count from.
     /// Only differences between timestamps matter to the server.
     timeseal_start: Option<Instant>,
+    /// Set once reading or writing the socket has failed (or the
+    /// server closed it): the connection is gone and needs replacing.
+    dead: bool,
 }
 
 impl IcsConn {
@@ -69,13 +77,26 @@ impl IcsConn {
             None => None,
         };
 
+        let stream = TcpStream::connect((host, port))
+            .await
+            .with_context(|| format!("failed to connect to {host}:{port}"))?;
+        // Probes during quiet stretches keep routers from dropping the
+        // idle connection, and let a dead one be noticed within about a
+        // minute rather than hours. Best-effort: without it we still
+        // work, just as before.
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(KEEPALIVE_IDLE)
+            .with_interval(KEEPALIVE_INTERVAL);
+        if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+            tracing::warn!("could not enable TCP keepalive: {e}");
+        }
+
         let mut conn = IcsConn {
-            stream: TcpStream::connect((host, port))
-                .await
-                .with_context(|| format!("failed to connect to {host}:{port}"))?,
+            stream,
             pending: Vec::new(),
             debug_log,
             timeseal_start: timeseal.then(Instant::now),
+            dead: false,
         };
         conn.log_event(&format!("connected to {host}:{port}"));
         if timeseal {
@@ -120,9 +141,21 @@ impl IcsConn {
     }
 
     async fn write_raw(&mut self, buf: &[u8]) -> Result<()> {
-        self.stream.write_all(buf).await?;
-        self.stream.flush().await?;
-        Ok(())
+        let result = async {
+            self.stream.write_all(buf).await?;
+            self.stream.flush().await
+        }
+        .await;
+        if let Err(e) = &result {
+            self.dead = true;
+            self.log_event(&format!("write failed: {e}"));
+        }
+        Ok(result?)
+    }
+
+    /// Whether the connection has failed and needs replacing.
+    pub fn is_dead(&self) -> bool {
+        self.dead
     }
 
     /// Read raw bytes off the socket into our pending buffer, stripping
@@ -130,8 +163,16 @@ impl IcsConn {
     /// Mirrors ProcessRawInput's telnet state machine.
     async fn fill(&mut self) -> Result<usize> {
         let mut chunk = [0u8; 4096];
-        let n = self.stream.read(&mut chunk).await?;
+        let n = match self.stream.read(&mut chunk).await {
+            Ok(n) => n,
+            Err(e) => {
+                self.dead = true;
+                self.log_event(&format!("read failed: {e}"));
+                return Err(e.into());
+            }
+        };
         if n == 0 {
+            self.dead = true;
             self.log_event("connection closed by server");
             anyhow::bail!("ICS connection closed");
         }
@@ -348,4 +389,24 @@ mod tests {
             "fics% \\n\\r\\xff\\xfb\\x01a\\\"b\\\\"
         );
     }
+
+    #[tokio::test]
+    async fn enables_keepalive_and_notices_a_dropped_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"fics% \n").await.unwrap();
+            // Then hang up, as a dropped connection looks to us.
+        });
+
+        let mut conn = IcsConn::connect("127.0.0.1", port, None, false).await.unwrap();
+        assert!(socket2::SockRef::from(&conn.stream).keepalive().unwrap());
+        assert_eq!(conn.read_line().await.unwrap(), "fics% ");
+        assert!(!conn.is_dead());
+        server.await.unwrap();
+        assert!(conn.read_line().await.is_err());
+        assert!(conn.is_dead());
+    }
 }
+
