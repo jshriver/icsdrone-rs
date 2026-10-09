@@ -102,6 +102,9 @@ the terminal (Windows, Linux and macOS):
   your side at the bottom.
 - **Player bars** with names and clocks; the side to move's clock
   counts down live and turns red under 10 seconds.
+- **Material difference** to the right of the board, Lichess-style:
+  by each side's end of the board, the pieces that side is up on and,
+  for the side ahead, its lead in points (`+3`).
 - **Resign** button above the engine panel during a game. It asks
   for confirmation first, then sends FICS's `resign`.
 - **Engine** panel: best move, score, depth, time, nodes, NPS and the

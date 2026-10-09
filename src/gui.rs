@@ -697,7 +697,10 @@ fn board_area(ui: &mut egui::Ui, state: &GuiState) {
 
     let bar_height = 44.0;
     let avail = ui.available_size();
-    let size = avail.x.min(avail.y - 2.0 * bar_height - 16.0).max(160.0);
+    // Room either side of the centered board for the material column.
+    let size = (avail.x - 2.0 * MATERIAL_COLUMN)
+        .min(avail.y - 2.0 * bar_height - 16.0)
+        .max(160.0);
 
     ui.vertical_centered(|ui| {
         ui.set_width(size);
@@ -706,13 +709,20 @@ fn board_area(ui: &mut egui::Ui, state: &GuiState) {
         let (top, bottom) = if we_are_white { (black, white) } else { (white, black) };
 
         player_bar(ui, state, top.0, top.1, top.2, bar_height);
-        draw_board(ui, board, !we_are_white, size);
+        let board_rect = draw_board(ui, board, !we_are_white, size);
         player_bar(ui, state, bottom.0, bottom.1, bottom.2, bar_height);
+
+        // Lichess-style material difference to the right of the board,
+        // each side's by its own end of the board.
+        if let Some(board) = board {
+            let x = board_rect.right() + 8.0;
+            paint_material(ui, Pos2::new(x, board_rect.top() + 4.0), &board.rows, top.2);
+            let bottom_y = board_rect.bottom() - MATERIAL_ICON - 4.0;
+            paint_material(ui, Pos2::new(x, bottom_y), &board.rows, bottom.2);
+        }
     });
 }
 
-/// Both clocks, with the side to move's clock counting down since its
-/// board arrived (until the game ends).
 /// How long until a running clock showing `ms` displays a different
 /// second (`format_clock` drops the milliseconds), plus a few ms so the
 /// redraw lands just after the change rather than just before it.
@@ -728,6 +738,8 @@ fn until_clock_ticks(ms: i64) -> Duration {
     Duration::from_millis(wait + 5)
 }
 
+/// Both clocks, with the side to move's clock counting down since its
+/// board arrived (until the game ends).
 fn live_clocks(state: &GuiState) -> (Option<i64>, Option<i64>) {
     let Some((board, received)) = &state.board else {
         return (None, None);
@@ -790,13 +802,79 @@ fn player_bar(
         });
 }
 
+/// Lichess-style material difference for one side of `rows` (style12
+/// rows): the pieces it's up on, net, as the opponent's piece letters
+/// (most valuable first - what it has taken, in effect), and how many
+/// points ahead it is (P=1, N=B=3, R=5, Q=9), or 0 if it isn't.
+fn material_edge(rows: &[String; 8], white: bool) -> (Vec<u8>, i32) {
+    const PIECES: [(u8, i32); 5] = [(b'q', 9), (b'r', 5), (b'b', 3), (b'n', 3), (b'p', 1)];
+    let count = |letter: u8| {
+        rows.iter()
+            .flat_map(|row| row.bytes())
+            .filter(|&b| b == letter)
+            .count() as i32
+    };
+    let mut pieces = Vec::new();
+    let mut points = 0;
+    for (black_letter, value) in PIECES {
+        let white_letter = black_letter.to_ascii_uppercase();
+        let (mine, theirs) = if white {
+            (white_letter, black_letter)
+        } else {
+            (black_letter, white_letter)
+        };
+        let diff = count(mine) - count(theirs);
+        points += diff * value;
+        for _ in 0..diff.max(0) {
+            pieces.push(theirs);
+        }
+    }
+    (pieces, points.max(0))
+}
+
+/// Width kept free beside the board for the material difference.
+const MATERIAL_COLUMN: f32 = 110.0;
+/// Size of its piece icons.
+const MATERIAL_ICON: f32 = 18.0;
+
+/// Paint one side's material difference in a row starting at `at`
+/// (its top-left): small piece icons, then "+N" when that side is
+/// ahead. Pieces of one kind overlap a little, as on Lichess.
+fn paint_material(ui: &egui::Ui, at: Pos2, rows: &[String; 8], white: bool) {
+    let (pieces, points) = material_edge(rows, white);
+    let mut x = at.x;
+    for (i, &piece) in pieces.iter().enumerate() {
+        if i > 0 {
+            let same = pieces[i - 1] == piece;
+            x += if same { MATERIAL_ICON * 0.55 } else { MATERIAL_ICON + 2.0 };
+        }
+        if let Some(image) = piece_image(piece) {
+            let rect = Rect::from_min_size(Pos2::new(x, at.y), Vec2::splat(MATERIAL_ICON));
+            egui::Image::new(image).paint_at(ui, rect);
+        }
+    }
+    if points > 0 {
+        if !pieces.is_empty() {
+            x += MATERIAL_ICON + 4.0;
+        }
+        ui.painter().text(
+            Pos2::new(x, at.y + MATERIAL_ICON / 2.0),
+            egui::Align2::LEFT_CENTER,
+            format!("+{points}"),
+            FontId::proportional(14.0),
+            ui.visuals().weak_text_color(),
+        );
+    }
+}
+
 /// The starting position in style12 row form (rank 8 first), shown
 /// until the first game's board arrives.
 const START_ROWS: [&str; 8] = [
     "rnbqkbnr", "pppppppp", "--------", "--------", "--------", "--------", "PPPPPPPP", "RNBQKBNR",
 ];
 
-fn draw_board(ui: &mut egui::Ui, board: Option<&Style12>, flipped: bool, size: f32) {
+/// Draw the board; returns where it went.
+fn draw_board(ui: &mut egui::Ui, board: Option<&Style12>, flipped: bool, size: f32) -> Rect {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let painter = ui.painter_at(rect);
     let square = size / 8.0;
@@ -843,6 +921,7 @@ fn draw_board(ui: &mut egui::Ui, board: Option<&Style12>, flipped: bool, size: f
             }
         }
     }
+    rect
 }
 
 /// The merida image for a style12 piece letter (uppercase = White).
@@ -1010,6 +1089,27 @@ mod tests {
         assert_eq!(until_clock_ticks(299_000), Duration::from_millis(1005));
         // Overstayed (negative): -0:01.300 becomes -0:02 in 700ms.
         assert_eq!(until_clock_ticks(-1_300), Duration::from_millis(705));
+    }
+
+    #[test]
+    fn material_edge_counts_pieces_up_and_points() {
+        let rows = |r: [&str; 8]| r.map(String::from);
+        let start = rows(START_ROWS);
+        assert_eq!(material_edge(&start, true), (vec![], 0));
+        assert_eq!(material_edge(&start, false), (vec![], 0));
+        // White has taken a knight; Black has taken two pawns.
+        let traded = rows([
+            "r-bqkbnr", "pppppppp", "--------", "--------", "--------", "--------",
+            "PPPPPP--", "RNBQKBNR",
+        ]);
+        assert_eq!(material_edge(&traded, true), (vec![b'n'], 1));
+        assert_eq!(material_edge(&traded, false), (vec![b'P', b'P'], 0));
+        // A promoted queen counts as a queen.
+        let promoted = rows([
+            "Q---k---", "--------", "--------", "--------", "--------", "--------",
+            "--------", "----K---",
+        ]);
+        assert_eq!(material_edge(&promoted, true), (vec![b'q'], 9));
     }
 
     #[test]
