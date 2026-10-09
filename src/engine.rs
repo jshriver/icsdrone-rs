@@ -20,6 +20,10 @@ pub struct UciEngine {
     /// is cancel-safe inside `select!`.
     lines: mpsc::UnboundedReceiver<String>,
     pub name: Option<String>,
+    /// A `go` (ponder or not) is running: its `bestmove` is still to
+    /// come. Kept so a new search never overlaps an old one and `stop`
+    /// knows whether there's an answer to wait for.
+    searching: bool,
 }
 
 /// How long `stop()` waits for the engine's post-abort "bestmove" line
@@ -220,6 +224,7 @@ impl UciEngine {
             stdin,
             lines,
             name: None,
+            searching: false,
         };
 
         engine.send("uci").await?;
@@ -309,6 +314,7 @@ impl UciEngine {
     /// that FEN (empty for "just this position"). Mirrors
     /// SendBoardToComputer + SendMovesToComputer.
     pub async fn set_position(&mut self, fen: &str, moves: &[String]) -> Result<()> {
+        self.ensure_idle().await?;
         let cmd = if moves.is_empty() {
             format!("position fen {fen}")
         } else {
@@ -346,6 +352,7 @@ impl UciEngine {
         binc_ms: i64,
         ponder: bool,
     ) -> Result<()> {
+        self.ensure_idle().await?;
         let cmd = format!(
             "go {}wtime {} btime {} winc {} binc {}",
             if ponder { "ponder " } else { "" },
@@ -354,7 +361,29 @@ impl UciEngine {
             winc_ms.max(0),
             binc_ms.max(0)
         );
-        self.send(&cmd).await
+        self.send(&cmd).await?;
+        self.searching = true;
+        Ok(())
+    }
+
+    /// Make sure no search is running and no old output is waiting
+    /// before a new search starts: stop a search still running, and
+    /// throw away anything already buffered - a leftover "bestmove"
+    /// would otherwise be read as the next search's answer, putting
+    /// every move after it one search behind the game.
+    async fn ensure_idle(&mut self) -> Result<()> {
+        if self.searching {
+            warn!("a search was still running; stopping it first");
+            self.stop().await?;
+        }
+        while let Ok(line) = self.lines.try_recv() {
+            if line.trim().starts_with("bestmove") {
+                warn!("discarding a stale engine answer: {}", line.trim());
+            } else {
+                debug!("discarding stale engine output: {}", line.trim());
+            }
+        }
+        Ok(())
     }
 
     /// The opponent played the move we were pondering on: the ponder
@@ -372,6 +401,7 @@ impl UciEngine {
             let line = self.read_line().await?;
             let line = line.trim();
             if let Some(rest) = line.strip_prefix("bestmove ") {
+                self.searching = false;
                 let mut parts = rest.split_whitespace();
                 let bestmove = parts
                     .next()
@@ -413,11 +443,19 @@ impl UciEngine {
     /// Best-effort: an engine that's wedged and never responds to
     /// "stop" only costs us up to `STOP_DRAIN_TIMEOUT`, not a hang.
     pub async fn stop(&mut self) -> Result<()> {
+        if !self.searching {
+            return Ok(()); // nothing running, so no answer to wait for
+        }
         self.send("stop").await?;
         match tokio::time::timeout(STOP_DRAIN_TIMEOUT, self.drain_until_bestmove()).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                self.searching = false;
+                Ok(())
+            }
             Ok(Err(e)) => Err(e),
             Err(_) => {
+                // Still counted as searching, so the late answer is
+                // dealt with before the next search starts.
                 warn!(
                     "engine didn't respond to \"stop\" within {:?}; proceeding anyway",
                     STOP_DRAIN_TIMEOUT
@@ -489,6 +527,9 @@ for line in sys.stdin:
         print("bestmove d2d4")
     elif line.startswith("go movetime 2"):
         print("bestmove c2c4")
+    elif line.startswith("go movetime 3"):
+        print("info depth 5 score cp 0 nodes 1 nps 1 time 1 pv h2h4")
+        print("bestmove h2h4")
     elif line.startswith("go ponder"):
         pondering = True  # thinks until "ponderhit" or "stop"
     elif line.startswith("go"):
@@ -605,27 +646,22 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn stop_drains_a_bestmove_left_unread_on_the_pipe() {
+    async fn stop_drains_the_answer_of_a_running_search() {
         let (script_path, log_path) = write_fake_engine();
 
         let command_line = format!("python3 {} {}", script_path.display(), log_path.display());
         let mut engine = UciEngine::spawn(&command_line, &BTreeMap::new()).await.unwrap();
 
+        // A ponder search runs until stopped; stop() must drain the
+        // "bestmove a2a3" it answers with...
         engine.set_position("startpos", &[]).await.unwrap();
-        // Bypass go_and_wait so its "info ..." and "bestmove e2e4"
-        // response sit unread in the pipe - simulating a search we
-        // abandoned (e.g. because the game ended) without ever reading
-        // its result.
-        engine.send_raw("go wtime 60000 btime 60000").await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // stop() must drain that stray "bestmove" itself.
+        engine.go(60000, 60000, 0, 0, true).await.unwrap();
         engine.stop().await.unwrap();
-
-        // A fresh search should see *its own* bestmove, proving the
-        // earlier one was actually drained rather than just timed out.
+        // ...so the next search sees its own answer, not that one.
         let result = engine.go_and_wait(60000, 60000, 0, 0).await.unwrap();
         assert_eq!(result.bestmove, "e2e4");
+        // Stopping with nothing running doesn't wait for an answer.
+        engine.stop().await.unwrap();
 
         engine.quit().await.unwrap();
         std::fs::remove_file(&script_path).ok();
@@ -676,5 +712,31 @@ for line in sys.stdin:
         engine.quit().await.unwrap();
         std::fs::remove_file(&script_path).ok();
         std::fs::remove_file(&log_path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_new_search_never_reads_an_old_answer() {
+        let (script_path, log_path) = write_fake_engine();
+        let command_line = format!("python3 {} {}", script_path.display(), log_path.display());
+        let mut engine = UciEngine::spawn(&command_line, &BTreeMap::new()).await.unwrap();
+
+        // A stray answer ("bestmove h2h4") left waiting, as after the
+        // reconnect that put a game one move behind.
+        engine.send_raw("go movetime 3").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let result = engine.go_and_wait(60000, 60000, 0, 0).await.unwrap();
+        assert_eq!(result.bestmove, "e2e4");
+
+        // A ponder search still running when a new search starts is
+        // stopped (its "bestmove a2a3" drained) first.
+        engine.go(60000, 60000, 0, 0, true).await.unwrap();
+        let result = engine.go_and_wait(60000, 60000, 0, 0).await.unwrap();
+        assert_eq!(result.bestmove, "e2e4");
+
+        engine.quit().await.unwrap();
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        std::fs::remove_file(&script_path).ok();
+        std::fs::remove_file(&log_path).ok();
+        assert!(log.contains("go ponder wtime 60000 btime 60000 winc 0 binc 0\nstop\ngo wtime"));
     }
 }
