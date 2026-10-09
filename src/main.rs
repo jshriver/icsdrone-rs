@@ -4,6 +4,7 @@ mod book;
 mod config;
 mod engine;
 mod gui;
+mod history;
 mod ics;
 mod pgn;
 mod san;
@@ -73,6 +74,26 @@ fn detach_windows_console() {
 #[cfg(not(windows))]
 fn detach_windows_console() {}
 
+/// WAYLAND_DISPLAY is set, but the socket it names doesn't exist.
+#[cfg(target_os = "linux")]
+fn wayland_socket_missing() -> bool {
+    let Some(name) = std::env::var_os("WAYLAND_DISPLAY").filter(|n| !n.is_empty()) else {
+        return false;
+    };
+    let path = std::path::Path::new(&name);
+    let socket = match std::env::var_os("XDG_RUNTIME_DIR") {
+        _ if path.is_absolute() => path.to_path_buf(),
+        Some(dir) => std::path::Path::new(&dir).join(path),
+        None => return true,
+    };
+    !socket.exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wayland_socket_missing() -> bool {
+    false
+}
+
 fn main() -> Result<()> {
     let config = Config::parse();
 
@@ -92,6 +113,14 @@ fn main() -> Result<()> {
         if std::env::var_os("EGL_LOG_LEVEL").is_none() {
             // SAFETY: still single-threaded - the runtime isn't built yet.
             unsafe { std::env::set_var("EGL_LOG_LEVEL", "fatal") };
+        }
+        // WSL sometimes loses /run/user/<uid>, leaving WAYLAND_DISPLAY
+        // naming a socket that isn't there; the window then fails with
+        // "Could not find wayland compositor". Use X11 instead when
+        // there is one.
+        if wayland_socket_missing() && std::env::var_os("DISPLAY").is_some() {
+            // SAFETY: still single-threaded - the runtime isn't built yet.
+            unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
         }
     } else {
         enable_windows_ansi_support();
@@ -133,6 +162,11 @@ fn main() -> Result<()> {
             cmd_rx,
         ));
         let gui_result = gui::run(shared, cmd_tx.clone(), title);
+        // The window couldn't open (or crashed), so it can't show this
+        // itself: the terminal is the only place left to say why.
+        if let Err(e) = &gui_result {
+            eprintln!("icsdrone-rs: {e:#}");
+        }
 
         // The window is closed - by the user, or because the bot quit.
         // Make sure the bot logs off and stops the engine either way.

@@ -6,6 +6,7 @@ use anyhow::Result;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -16,8 +17,16 @@ use crate::config::{Config, ConfigFile, KibitzMode};
 use crate::engine::{SearchResult, UciEngine};
 use crate::gui::{GuiShared, LineKind, SearchView};
 use crate::ics::IcsConn;
+use crate::history::GameHistory;
 use crate::pgn::{self, GameAnnouncement, PgnGame};
 use crate::san;
+
+/// A `go ponder` search in progress - see `App::ponder`.
+struct Ponder {
+    game_number: i32,
+    base_fen: String,
+    moves: Vec<String>,
+}
 
 pub struct App {
     ics: IcsConn,
@@ -61,6 +70,16 @@ pub struct App {
     site: String,
     /// The game being recorded for `save_pgn`.
     pgn_game: Option<PgnGame>,
+    /// UCI moves of the game we're playing, sent to the engine with
+    /// every search so it can see repetitions.
+    history: Option<GameHistory>,
+    /// `"Ponder": "true"` under `engine_options`: think on the
+    /// opponent's time about the reply the engine expects.
+    ponder_enabled: bool,
+    /// Set while the engine ponders: the game, and the position (as
+    /// base FEN + moves) it's pondering, i.e. after our move and the
+    /// opponent's expected reply.
+    ponder: Option<Ponder>,
     /// The latest "Creating: ..." line, picked up by the next game's
     /// PGN for its ratings and game type.
     announcement: Option<GameAnnouncement>,
@@ -126,11 +145,29 @@ impl App {
         // Ponder/OwnBook/NNUE (default false/false/true) plus whatever
         // was listed explicitly under engine_options.
         let engine_options = config_file.resolve_engine_options();
+        let ponder_enabled = engine_options
+            .get("Ponder")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
 
         let book = match config_file.resolve_book_path() {
             Some(path) => {
-                info!("Loading opening book: {}", path.display());
-                Some(OpeningBook::load(path)?)
+                // A big book can take a while; without this the window
+                // would sit on "Connecting…" the whole time.
+                let size = std::fs::metadata(&path)
+                    .map(|m| format!(" ({:.1} GB)", m.len() as f64 / 1e9))
+                    .unwrap_or_default();
+                let loading = format!("Loading opening book {}{size}…", path.display());
+                if let Some(gui) = &gui {
+                    gui.update(|s| s.status = loading.clone());
+                }
+                notify(gui.as_deref(), &loading);
+                let started = Instant::now();
+                let book = OpeningBook::load(path)?;
+                notify(
+                    gui.as_deref(),
+                    &format!("Opening book loaded in {:.1}s", started.elapsed().as_secs_f64()),
+                );
+                Some(book)
             }
             None => {
                 info!("No opening book configured");
@@ -140,6 +177,9 @@ impl App {
 
         let engine_cmd = config_file.resolve_engine();
         info!("Spawning engine: {}", engine_cmd);
+        if let Some(gui) = &gui {
+            gui.update(|s| s.status = format!("Starting engine {engine_cmd}…"));
+        }
         let engine = UciEngine::spawn(&engine_cmd, &engine_options).await?;
 
         if let Some(gui) = &gui {
@@ -166,6 +206,9 @@ impl App {
             save_pgn: config_file.resolve_save_pgn(),
             site: host,
             pgn_game: None,
+            history: None,
+            ponder_enabled,
+            ponder: None,
             announcement: None,
         })
     }
@@ -174,7 +217,8 @@ impl App {
     /// by asking the engine for a move and sending it back. Equivalent
     /// to MainLoop()'s select() over the ICS and engine file
     /// descriptors, simplified since in this MVP we only need to react
-    /// to the engine when it's actually our move (no ponder/analysis).
+    /// to the engine when it's our move (and, with `Ponder` on, while
+    /// it's the opponent's - see `handle_style12`).
     ///
     /// Commands arrive on `cmd_rx`: lines typed at the terminal prompt
     /// (fed in by a reader task using `cmd_tx`) and, with `GUI` on,
@@ -285,6 +329,7 @@ impl App {
             // just need to know the game is over so we stop treating
             // any further style12 lines as belonging to it.
             notify(self.gui.as_deref(), &format!("Game ended: {}", line.trim()));
+            self.stop_pondering().await;
             self.game_over(line);
         } else if line.contains("no longer") && line.contains("observing") {
             // benign
@@ -318,6 +363,13 @@ impl App {
         }
 
         if let Some(rest) = cmd.strip_prefix("engine ") {
+            if self.ponder.is_some() {
+                notify(
+                    self.gui.as_deref(),
+                    "The engine is pondering; send engine commands between games.",
+                );
+                return Ok(false);
+            }
             info!("-> engine (manual): {}", rest);
             self.engine.send_raw(rest).await?;
         } else {
@@ -331,6 +383,7 @@ impl App {
         self.game_number = None;
         self.we_are_white = None;
         self.last_kibitz = None;
+        self.history = None;
     }
 
     /// The game we're playing has ended on `line` ("{Game N (...) ...}
@@ -346,9 +399,9 @@ impl App {
         }
     }
 
-    /// Combines the `White`/`Black`/`Move`/`Clock`/`Kibitz` header with the board
-    /// render into what actually gets printed, prefixed with an ANSI
-    /// "clear screen, cursor home" escape only when `ansi_ok` is true.
+    /// The board render (plus any kibitz line) as it actually gets
+    /// printed, prefixed with an ANSI "clear screen, cursor home"
+    /// escape only when `ansi_ok` is true.
     /// Callers pass `self.color_board` for `ansi_ok`: if a terminal
     /// can't handle the square-highlighting escapes `to_board_string`
     /// emits (that's what `ColorBoard: "No"` is for), it can't handle
@@ -356,11 +409,11 @@ impl App {
     /// `ColorBoard: "No"` needs to suppress this prefix too, not just
     /// the highlighting, or the console never actually becomes free of
     /// ANSI codes.
-    fn board_frame(header: &str, board_str: &str, ansi_ok: bool) -> String {
+    fn board_frame(board_str: &str, ansi_ok: bool) -> String {
         if ansi_ok {
-            format!("\x1B[2J\x1B[1;1H{header}\n\n{board_str}")
+            format!("\x1B[2J\x1B[1;1H{board_str}")
         } else {
-            format!("{header}\n\n{board_str}")
+            board_str.to_string()
         }
     }
 
@@ -392,23 +445,15 @@ impl App {
         }
     }
 
-    /// Print `board` and its header (players, last move, clocks, last
-    /// kibitz) to the terminal, plain or colored per `ColorBoard`.
+    /// Print `board` FICS style 1 (players, last move and clocks
+    /// included), and the last kibitz under it, to the terminal, plain
+    /// or colored per `ColorBoard`.
     fn print_board(&self, board: &Style12) {
-        let mut header = format!(
-            "White: {}  Black: {}\nMove: {}\nClock: White {}  Black {}",
-            board.white_name,
-            board.black_name,
-            board.last_move_verbose,
-            format_clock(board.white_time_ms),
-            format_clock(board.black_time_ms)
-        );
+        let mut text = board.to_board_string(self.color_board);
         if let Some(kibitz) = &self.last_kibitz {
-            header.push_str(&format!("\nKibitz: {kibitz}"));
+            text.push_str(&format!("\n\nKibitz: {kibitz}"));
         }
-
-        let board_str = board.to_board_string(self.color_board);
-        println!("{}", Self::board_frame(&header, &board_str, self.color_board));
+        println!("{}", Self::board_frame(&text, self.color_board));
     }
 
     async fn handle_style12(&mut self, line: &str) -> Result<()> {
@@ -442,6 +487,24 @@ impl App {
             self.last_kibitz = None;
         }
 
+        if self
+            .ponder
+            .as_ref()
+            .is_some_and(|p| p.game_number != board.game_number)
+        {
+            self.stop_pondering().await;
+        }
+
+        let history = match self.history.take() {
+            Some(mut history) if history.game_number == board.game_number => {
+                history.record(&board);
+                history
+            }
+            _ => GameHistory::new(&board),
+        };
+        let history = self.history.insert(history);
+        let (base_fen, moves) = (history.base_fen().to_string(), history.moves().to_vec());
+
         if self.save_pgn.is_some() {
             if self.pgn_game.as_ref().map(|g| g.game_number) != Some(board.game_number) {
                 let announcement = self.announcement.take();
@@ -468,11 +531,35 @@ impl App {
             return Ok(()); // opponent to move (or we just moved), nothing to do
         }
 
-        // Style12 always describes the *current* full board, so we can
-        // hand the engine a fresh FEN each turn instead of maintaining
-        // our own move list - simpler than the original's incremental
-        // SendMovesToComputer/SendBoardToComputer bookkeeping.
+        // The current board, for the book lookup and SAN display. The
+        // engine instead gets the game's base position plus every move
+        // since (`history` above) - a bare FEN would hide the earlier
+        // positions from it, so it couldn't see repetitions.
         let fen = board.to_fen();
+        let winc = board.increment_seconds as i64 * 1000;
+        let game_number = board.game_number;
+        // Our clock is running from here; the PGN notes the time we took.
+        let started = Instant::now();
+
+        // If the engine was pondering and the opponent played the
+        // expected reply, that search is already well under way on
+        // exactly this position: let it carry on as the real search.
+        // Any other reply makes it useless, so stop it.
+        let ponder_hit = match self.ponder.take() {
+            Some(p) if p.base_fen == base_fen && p.moves == moves => {
+                info!("Ponder hit");
+                self.engine.ponderhit().await?;
+                true
+            }
+            Some(_) => {
+                info!("Ponder miss");
+                if let Err(e) = self.engine.stop().await {
+                    warn!("failed to stop pondering cleanly: {e}");
+                }
+                false
+            }
+            None => false,
+        };
 
         // If we have an opening book and it has a move for this exact
         // position, play that instead of asking the engine to search -
@@ -481,10 +568,16 @@ impl App {
         // every subsequent move this game goes back to the engine as
         // usual, since a Polyglot book has no concept of "resume
         // search from here".
-        if let Some(book_move) = self.book.as_ref().and_then(|b| b.best_move_from_fen(&fen)) {
+        let book_move = if ponder_hit {
+            None
+        } else {
+            self.book.as_ref().and_then(|b| b.best_move_from_fen(&fen))
+        };
+        if let Some(book_move) = book_move {
             info!("Book move: {}", book_move);
             if let Some(gui) = &self.gui {
                 gui.update(|s| {
+                    s.mark_book(board.ply() + 1);
                     s.search = Some(SearchView {
                         bestmove: san::move_to_san(&fen, &book_move),
                         from_book: true,
@@ -493,18 +586,21 @@ impl App {
                     })
                 });
             }
+            if let Some(game) = &mut self.pgn_game {
+                game.annotate(board.ply() + 1, "book".to_string());
+            }
             self.ics.send(&to_ics_move(&book_move)).await?;
             return Ok(());
         }
 
-        self.engine.set_position(&fen, &[]).await?;
+        if !ponder_hit {
+            self.engine.set_position(&base_fen, &moves).await?;
+            self.engine
+                .go(board.white_time_ms, board.black_time_ms, winc, winc, false)
+                .await?;
+        }
 
-        let winc = board.increment_seconds as i64 * 1000;
-        let game_number = board.game_number;
-        let result = match self
-            .search_or_abort(game_number, board.white_time_ms, board.black_time_ms, winc)
-            .await?
-        {
+        let result = match self.search_or_abort(game_number).await? {
             Some(result) => result,
             // Game ended (opponent flagged/resigned/aborted, etc.)
             // while the engine was still thinking - search_or_abort
@@ -513,7 +609,19 @@ impl App {
             None => return Ok(()),
         };
 
-        info!("Engine plays: {}", result.bestmove);
+        if result.from_book {
+            info!("Engine plays from its own book: {}", result.bestmove);
+        } else {
+            info!("Engine plays: {}", result.bestmove);
+        }
+        if let Some(game) = &mut self.pgn_game {
+            let note = if result.from_book {
+                "book".to_string()
+            } else {
+                pgn::engine_note(result.info.as_ref(), started.elapsed())
+            };
+            game.annotate(board.ply() + 1, note);
+        }
 
         // Announce the search stats behind this move, if enabled -
         // mirrors what a human kibitzing their own analysis would post,
@@ -543,9 +651,12 @@ impl App {
                 if let Some(info) = &result.info {
                     s.push_score(&board, info);
                 }
+                if result.from_book {
+                    s.mark_book(board.ply() + 1);
+                }
                 s.search = Some(SearchView {
                     bestmove: san::move_to_san(&fen, &result.bestmove),
-                    from_book: false,
+                    from_book: result.from_book,
                     info: result.info.clone(),
                     pv: result
                         .info
@@ -558,10 +669,41 @@ impl App {
 
         self.ics.send(&to_ics_move(&result.bestmove)).await?;
 
+        // Think on the opponent's time about the reply the engine
+        // expects, from the position after it. Uses the clocks as of
+        // this board, as UCI GUIs do; `ponderhit` turns it into our
+        // next search if the opponent obliges.
+        if let (true, Some(reply)) = (self.ponder_enabled, result.ponder) {
+            let mut ponder_moves = moves;
+            ponder_moves.push(result.bestmove);
+            ponder_moves.push(reply.clone());
+            info!("Pondering on {reply}");
+            self.engine.set_position(&base_fen, &ponder_moves).await?;
+            self.engine
+                .go(board.white_time_ms, board.black_time_ms, winc, winc, true)
+                .await?;
+            self.ponder = Some(Ponder {
+                game_number,
+                base_fen,
+                moves: ponder_moves,
+            });
+        }
+
         Ok(())
     }
 
-    /// Runs the engine search for the current move, racing it against
+    /// Stop a ponder search, if one is running (the game ended, or a
+    /// new one started).
+    async fn stop_pondering(&mut self) {
+        if self.ponder.take().is_some() {
+            if let Err(e) = self.engine.stop().await {
+                warn!("failed to stop pondering cleanly: {e}");
+            }
+        }
+    }
+
+    /// Waits for the engine search for the current move (already
+    /// started with `go`, or `ponderhit`), racing it against
     /// further ICS lines: if a "game over" line for `game_number`
     /// arrives before the engine finishes thinking (we flagged, the
     /// opponent resigned, the game was aborted, etc.), the search is
@@ -578,20 +720,9 @@ impl App {
     /// out right away, "quit" abandons the search and quits (`Ok(None)`
     /// with `quit_requested` set), and "engine ..." is refused since
     /// the engine is mid-search.
-    async fn search_or_abort(
-        &mut self,
-        game_number: i32,
-        white_time_ms: i64,
-        black_time_ms: i64,
-        increment_ms: i64,
-    ) -> Result<Option<SearchResult>> {
+    async fn search_or_abort(&mut self, game_number: i32) -> Result<Option<SearchResult>> {
         let marker = format!("Game {game_number} ");
-        let mut search = Box::pin(self.engine.go_and_wait(
-            white_time_ms,
-            black_time_ms,
-            increment_ms,
-            increment_ms,
-        ));
+        let mut search = Box::pin(self.engine.wait_bestmove());
 
         loop {
             tokio::select! {
@@ -708,6 +839,8 @@ fn echo_command(gui: Option<&GuiShared>, cmd: &str) {
 fn show_server_line(gui: Option<&GuiShared>, line: &str) {
     let line = line.trim_end();
     match gui {
+        // A bare prompt is just noise in the window.
+        Some(_) if line.trim() == "fics%" => {}
         Some(gui) => gui.console(LineKind::Server, line),
         None => println!("{line}"),
     }
@@ -853,8 +986,8 @@ mod tests {
 
     #[test]
     fn board_frame_prefixes_clear_screen_when_ansi_ok() {
-        let frame = App::board_frame("White: alice  Black: bob", "  +---+", true);
-        assert_eq!(frame, "\x1B[2J\x1B[1;1HWhite: alice  Black: bob\n\n  +---+");
+        let frame = App::board_frame("Game 1 (alice vs. bob)", true);
+        assert_eq!(frame, "\x1B[2J\x1B[1;1HGame 1 (alice vs. bob)");
     }
 
     #[test]
@@ -863,8 +996,8 @@ mod tests {
         // all, not just the square-highlighting codes - so the
         // clear-screen escape must be left out too, or the console
         // never actually becomes free of ANSI codes.
-        let frame = App::board_frame("White: alice  Black: bob", "  +---+", false);
-        assert_eq!(frame, "White: alice  Black: bob\n\n  +---+");
+        let frame = App::board_frame("Game 1 (alice vs. bob)", false);
+        assert_eq!(frame, "Game 1 (alice vs. bob)");
         assert!(!frame.contains('\x1B'));
     }
 

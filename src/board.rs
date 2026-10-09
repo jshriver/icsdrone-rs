@@ -9,6 +9,8 @@
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::app::format_clock;
+
 /// My relation to the game, field 19 of a style12 line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Relation {
@@ -62,21 +64,20 @@ pub struct Style12 {
     // warning-free until then.
     pub initial_time_minutes: i32,
     pub increment_seconds: i32,
-    #[allow(dead_code)]
     pub white_strength: i32,
-    #[allow(dead_code)]
     pub black_strength: i32,
     pub white_time_ms: i64,
     pub black_time_ms: i64,
     pub next_move_number: u32,
     /// Verbose coordinate notation of the previous move, e.g. "e2-e4",
     /// or "none" for the initial position.
-    #[allow(dead_code)]
     pub last_move_verbose: String,
     /// The previous move in algebraic notation, e.g. "Nf3", "Qxc4",
     /// "O-O" (style12 field 28), or "none" for the initial position.
     /// Used for the GUI's move list.
     pub last_move_san: String,
+    /// Time the previous move took, e.g. "(0:02)" (style12 field 27).
+    pub last_move_time: String,
     #[allow(dead_code)]
     pub board_flipped: bool,
 }
@@ -121,6 +122,7 @@ impl Style12 {
         let black_time_ms: i64 = fields[24].parse::<i64>().context("black_time")? * 1000;
         let next_move_number: u32 = fields[25].parse().context("next_move_number")?;
         let last_move_verbose = fields.get(26).unwrap_or(&"none").to_string();
+        let last_move_time = fields.get(27).unwrap_or(&"(0:00)").to_string();
         let last_move_san = fields.get(28).unwrap_or(&"none").to_string();
         let board_flipped = fields.get(29).map(|s| *s == "1").unwrap_or(false);
 
@@ -146,6 +148,7 @@ impl Style12 {
             next_move_number,
             last_move_verbose,
             last_move_san,
+            last_move_time,
             board_flipped,
         })
     }
@@ -218,50 +221,39 @@ impl Style12 {
         )
     }
 
-    /// Render the current position as a bordered ASCII board, similar
-    /// to FICS's own "style 1" board display (`set style 1`), e.g.:
+    /// Render the board the way FICS does with `set style 1`, from our
+    /// side (Black at the bottom when we're Black), with the game's
+    /// details down the right:
     ///
     /// ```text
-    ///    +---+---+---+---+---+---+---+---+
-    ///  8 | r | n | b | q | k | b | n | r |
-    ///    +---+---+---+---+---+---+---+---+
-    ///  7 | p | p | p | p | p | p | p | p |
-    ///    +---+---+---+---+---+---+---+---+
-    ///  6 |   |   |   |   |   |   |   |   |
-    ///    +---+---+---+---+---+---+---+---+
-    ///  5 |   |   |   |   |   |   |   |   |
-    ///    +---+---+---+---+---+---+---+---+
-    ///  4 |   |   |   |   |   |   |   |   |
-    ///    +---+---+---+---+---+---+---+---+
-    ///  3 |   |   |   |   |   |   |   |   |
-    ///    +---+---+---+---+---+---+---+---+
-    ///  2 | P | P | P | P | P | P | P | P |
-    ///    +---+---+---+---+---+---+---+---+
-    ///  1 | R | N | B | Q | K | B | N | R |
-    ///    +---+---+---+---+---+---+---+---+
-    ///      a   b   c   d   e   f   g   h
+    /// Game 39 (GuestABCD vs. GuestEFGH)
+    ///
+    ///        ---------------------------------
+    ///     8  | *R| *N| *B| *Q| *K| *B| *N| *R|     Move # : 1 (White)
+    ///        |---+---+---+---+---+---+---+---|
+    ///     7  | *P| *P| *P| *P| *P| *P| *P| *P|
+    ///        |---+---+---+---+---+---+---+---|
+    ///     6  |   |   |   |   |   |   |   |   |
+    ///        |---+---+---+---+---+---+---+---|
+    ///     5  |   |   |   |   |   |   |   |   |
+    ///        |---+---+---+---+---+---+---+---|
+    ///     4  |   |   |   |   |   |   |   |   |     Black Clock : 5:00
+    ///        |---+---+---+---+---+---+---+---|
+    ///     3  |   |   |   |   |   |   |   |   |     White Clock : 5:00
+    ///        |---+---+---+---+---+---+---+---|
+    ///     2  | P | P | P | P | P | P | P | P |     Black Strength : 39
+    ///        |---+---+---+---+---+---+---+---|
+    ///     1  | R | N | B | Q | K | B | N | R |     White Strength : 39
+    ///        ---------------------------------
+    ///          a   b   c   d   e   f   g   h
     /// ```
     ///
+    /// Black pieces are marked with `*`, as FICS does. After a move,
+    /// the third rank line reads e.g. "Black Moves : 'e5'  (0:02)".
     /// Purely for the bot operator's own console - unlike `to_fen`,
     /// nothing in the engine/ICS protocol pipeline reads this.
     pub fn to_ascii_board(&self) -> String {
-        const BORDER: &str = "   +---+---+---+---+---+---+---+---+";
-        let mut out = String::new();
-        for (i, row) in self.rows.iter().enumerate() {
-            let rank = 8 - i;
-            out.push_str(BORDER);
-            out.push('\n');
-            out.push_str(&format!(" {rank} |"));
-            for c in row.chars() {
-                let square = if c == '-' { ' ' } else { c };
-                out.push_str(&format!(" {square} |"));
-            }
-            out.push('\n');
-        }
-        out.push_str(BORDER);
-        out.push('\n');
-        out.push_str("     a   b   c   d   e   f   g   h");
-        out
+        self.render_style1(false)
     }
 
     /// Same board as `to_ascii_board`, but with the previous move's
@@ -276,34 +268,98 @@ impl Style12 {
     /// Purely cosmetic, like `to_ascii_board`; nothing downstream
     /// parses this.
     pub fn to_ansi_board(&self) -> String {
-        const BORDER: &str = "   +---+---+---+---+---+---+---+---+";
+        self.render_style1(true)
+    }
+
+    /// Whether we're Black in a game we're playing, so the board is
+    /// drawn with Black at the bottom.
+    fn black_at_bottom(&self) -> bool {
+        match self.relation {
+            Relation::PlayingMyMove => !self.to_move_white,
+            Relation::PlayingOpponentMove => self.to_move_white,
+            _ => false,
+        }
+    }
+
+    fn render_style1(&self, highlight: bool) -> String {
+        const EDGE: &str = "       ---------------------------------";
+        const DIVIDER: &str = "       |---+---+---+---+---+---+---+---|";
         const RESET: &str = "\x1b[0m";
         const FROM_COLOR: &str = "\x1b[30;104m"; // black on light blue background
         const TO_COLOR: &str = "\x1b[30;106m"; // black on light cyan background
 
-        let (from_sq, to_sq) = self.last_move_squares().unzip();
+        let (from_sq, to_sq) = if highlight {
+            self.last_move_squares().unzip()
+        } else {
+            (None, None)
+        };
+        let side = |white: bool| if white { "White" } else { "Black" };
 
-        let mut out = String::new();
-        for (i, row) in self.rows.iter().enumerate() {
-            let rank = 8 - i;
-            out.push_str(BORDER);
-            out.push('\n');
-            out.push_str(&format!(" {rank} |"));
-            for (j, c) in row.chars().enumerate() {
-                let square = if c == '-' { ' ' } else { c };
+        // The details beside each rank line, top to bottom.
+        let mut info: [String; 8] = Default::default();
+        info[0] = format!(
+            "Move # : {} ({})",
+            self.next_move_number,
+            side(self.to_move_white)
+        );
+        if self.last_move_san != "none" {
+            info[2] = format!(
+                "{} Moves : '{}'  {}",
+                side(!self.to_move_white),
+                self.last_move_san,
+                self.last_move_time
+            );
+        }
+        info[4] = format!("Black Clock : {}", format_clock(self.black_time_ms));
+        info[5] = format!("White Clock : {}", format_clock(self.white_time_ms));
+        info[6] = format!("Black Strength : {}", self.black_strength);
+        info[7] = format!("White Strength : {}", self.white_strength);
+
+        // Rows and columns of `self.rows`, top-left first.
+        let order: Vec<usize> = if self.black_at_bottom() {
+            (0..8).rev().collect()
+        } else {
+            (0..8).collect()
+        };
+
+        let mut out = format!(
+            "Game {} ({} vs. {})\n\n{EDGE}\n",
+            self.game_number, self.white_name, self.black_name
+        );
+        for (line, &i) in order.iter().enumerate() {
+            if line > 0 {
+                out.push_str(DIVIDER);
+                out.push('\n');
+            }
+            out.push_str(&format!("    {}  |", 8 - i));
+            let row: Vec<char> = self.rows[i].chars().collect();
+            for &j in &order {
+                let cell = match row.get(j).copied().unwrap_or('-') {
+                    '-' => "   ".to_string(),
+                    c if c.is_ascii_uppercase() => format!(" {c} "),
+                    c => format!(" *{}", c.to_ascii_uppercase()),
+                };
                 if from_sq == Some((i, j)) {
-                    out.push_str(&format!("{FROM_COLOR} {square} {RESET}|"));
+                    out.push_str(&format!("{FROM_COLOR}{cell}{RESET}|"));
                 } else if to_sq == Some((i, j)) {
-                    out.push_str(&format!("{TO_COLOR} {square} {RESET}|"));
+                    out.push_str(&format!("{TO_COLOR}{cell}{RESET}|"));
                 } else {
-                    out.push_str(&format!(" {square} |"));
+                    out.push_str(&format!("{cell}|"));
                 }
+            }
+            if !info[line].is_empty() {
+                out.push_str("     ");
+                out.push_str(&info[line]);
             }
             out.push('\n');
         }
-        out.push_str(BORDER);
+        out.push_str(EDGE);
         out.push('\n');
-        out.push_str("     a   b   c   d   e   f   g   h");
+        let files: String = order
+            .iter()
+            .map(|&j| format!("   {}", (b'a' + j as u8) as char))
+            .collect();
+        out.push_str(&format!("      {files}"));
         out
     }
 
@@ -346,6 +402,38 @@ impl Style12 {
         let from = parse_square(from_tok)?;
         let to = parse_square(to_tok)?;
         Some((from, to))
+    }
+
+    /// The previous move in UCI notation ("e2e4", "e7e8q", "e1g1"),
+    /// translated from `last_move_verbose`, or `None` for the initial
+    /// position or anything unrecognized. Castling ("o-o"/"o-o-o")
+    /// carries no squares, so the king's are reconstructed from the
+    /// side that moved - the one *not* to move now.
+    pub fn last_move_uci(&self) -> Option<String> {
+        let verbose = self.last_move_verbose.as_str();
+        let rank = if self.to_move_white { '8' } else { '1' };
+        if verbose.eq_ignore_ascii_case("o-o") {
+            return Some(format!("e{rank}g{rank}"));
+        }
+        if verbose.eq_ignore_ascii_case("o-o-o") {
+            return Some(format!("e{rank}c{rank}"));
+        }
+        let (_, squares) = verbose.split_once('/')?;
+        let (from, rest) = squares.split_once('-')?;
+        let to = rest.get(..2)?;
+        if from.len() != 2 {
+            return None;
+        }
+        parse_square(from)?;
+        parse_square(to)?;
+        // "=Q" for a promotion; anything else after the square (e.g.
+        // an "ep" marker) isn't part of the UCI move.
+        let promotion = rest[2..]
+            .strip_prefix('=')
+            .and_then(|p| p.chars().next())
+            .map(|p| p.to_ascii_lowercase().to_string())
+            .unwrap_or_default();
+        Some(format!("{from}{to}{promotion}"))
     }
 }
 
@@ -409,27 +497,42 @@ mod tests {
 
     #[test]
     fn renders_ascii_board_for_start_position() {
-        let line = "<12> rnbqkbnr pppppppp -------- -------- -------- -------- PPPPPPPP RNBQKBNR W -1 1 1 1 1 0 39 GuestABCD GuestEFGH -1 5 0 39 39 300 300 1 none (0:00) none 0 0 0";
+        let line = "<12> rnbqkbnr pppppppp -------- -------- -------- -------- PPPPPPPP RNBQKBNR W -1 1 1 1 1 0 39 GuestABCD GuestEFGH 1 5 0 39 39 300 300 1 none (0:00) none 0 0 0";
         let s12 = Style12::parse(line).unwrap();
-        let expected = "   +---+---+---+---+---+---+---+---+
- 8 | r | n | b | q | k | b | n | r |
-   +---+---+---+---+---+---+---+---+
- 7 | p | p | p | p | p | p | p | p |
-   +---+---+---+---+---+---+---+---+
- 6 |   |   |   |   |   |   |   |   |
-   +---+---+---+---+---+---+---+---+
- 5 |   |   |   |   |   |   |   |   |
-   +---+---+---+---+---+---+---+---+
- 4 |   |   |   |   |   |   |   |   |
-   +---+---+---+---+---+---+---+---+
- 3 |   |   |   |   |   |   |   |   |
-   +---+---+---+---+---+---+---+---+
- 2 | P | P | P | P | P | P | P | P |
-   +---+---+---+---+---+---+---+---+
- 1 | R | N | B | Q | K | B | N | R |
-   +---+---+---+---+---+---+---+---+
-     a   b   c   d   e   f   g   h";
+        let expected = "Game 39 (GuestABCD vs. GuestEFGH)
+
+       ---------------------------------
+    8  | *R| *N| *B| *Q| *K| *B| *N| *R|     Move # : 1 (White)
+       |---+---+---+---+---+---+---+---|
+    7  | *P| *P| *P| *P| *P| *P| *P| *P|
+       |---+---+---+---+---+---+---+---|
+    6  |   |   |   |   |   |   |   |   |
+       |---+---+---+---+---+---+---+---|
+    5  |   |   |   |   |   |   |   |   |
+       |---+---+---+---+---+---+---+---|
+    4  |   |   |   |   |   |   |   |   |     Black Clock : 5:00
+       |---+---+---+---+---+---+---+---|
+    3  |   |   |   |   |   |   |   |   |     White Clock : 5:00
+       |---+---+---+---+---+---+---+---|
+    2  | P | P | P | P | P | P | P | P |     Black Strength : 39
+       |---+---+---+---+---+---+---+---|
+    1  | R | N | B | Q | K | B | N | R |     White Strength : 39
+       ---------------------------------
+         a   b   c   d   e   f   g   h";
         assert_eq!(s12.to_ascii_board(), expected);
+    }
+
+    #[test]
+    fn draws_the_board_from_blacks_side_when_we_are_black() {
+        // Opponent (White) to move after 1. e4 e5: we're Black.
+        let line = "<12> rnbqkbnr pppp-ppp -------- ----p--- ----P--- -------- PPPP-PPP RNBQKBNR W 4 1 1 1 1 0 39 GuestABCD GuestEFGH -1 5 0 39 39 298 296 2 P/e7-e5 (0:04) e5 0 0 0";
+        let board = Style12::parse(line).unwrap().to_ascii_board();
+        let lines: Vec<&str> = board.lines().collect();
+        assert_eq!(lines[3], "    1  | R | N | B | K | Q | B | N | R |     Move # : 2 (White)");
+        assert_eq!(lines[7], "    3  |   |   |   |   |   |   |   |   |     Black Moves : 'e5'  (0:04)");
+        assert_eq!(lines[11], "    5  |   |   |   | *P|   |   |   |   |     Black Clock : 4:56");
+        assert_eq!(lines[13], "    6  |   |   |   |   |   |   |   |   |     White Clock : 4:58");
+        assert_eq!(lines.last(), Some(&"         h   g   f   e   d   c   b   a"));
     }
 
     #[test]
@@ -461,6 +564,29 @@ mod tests {
         let mut castled = s12.clone();
         castled.last_move_verbose = "O-O".to_string();
         assert_eq!(castled.last_move_squares(), None);
+    }
+
+    #[test]
+    fn translates_last_move_to_uci() {
+        let line = "<12> rnbqkbnr pppppppp -------- -------- ----P--- -------- PPPP-PPP RNBQKBNR B 4 1 1 1 1 0 39 GuestABCD GuestEFGH -1 5 0 39 39 300 300 1 P/e2-e4 (0:00) e4 0 0 0";
+        let mut s12 = Style12::parse(line).unwrap();
+        assert_eq!(s12.last_move_uci().as_deref(), Some("e2e4"));
+
+        s12.last_move_verbose = "P/e7-e8=Q".to_string();
+        assert_eq!(s12.last_move_uci().as_deref(), Some("e7e8q"));
+        s12.last_move_verbose = "P/d5-c6ep".to_string();
+        assert_eq!(s12.last_move_uci().as_deref(), Some("d5c6"));
+
+        // Black to move now, so White just castled.
+        s12.last_move_verbose = "o-o".to_string();
+        assert_eq!(s12.last_move_uci().as_deref(), Some("e1g1"));
+        s12.last_move_verbose = "O-O-O".to_string();
+        assert_eq!(s12.last_move_uci().as_deref(), Some("e1c1"));
+        s12.to_move_white = true;
+        assert_eq!(s12.last_move_uci().as_deref(), Some("e8c8"));
+
+        s12.last_move_verbose = "none".to_string();
+        assert_eq!(s12.last_move_uci(), None);
     }
 
     #[test]

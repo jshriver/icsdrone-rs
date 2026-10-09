@@ -25,3 +25,8 @@ config.json
 
 # Games saved by SavePGN
 *.pgn
+
+# Local opening books and engine binary
+book.fbk
+frcbook.fbk
+erebus

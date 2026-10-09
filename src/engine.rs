@@ -7,13 +7,18 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 pub struct UciEngine {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Lines from the engine's stdout, read by a background task so
+    /// the engine never blocks on a full pipe while we aren't reading
+    /// (e.g. while it ponders on the opponent's time), and so reading
+    /// is cancel-safe inside `select!`.
+    lines: mpsc::UnboundedReceiver<String>,
     pub name: Option<String>,
 }
 
@@ -27,18 +32,19 @@ const STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub bestmove: String,
-    /// The engine's expected reply to `bestmove`, if it sent one.
-    /// Parsed for protocol completeness; not used yet since the app
-    /// doesn't do UCI pondering (starting the next search early)
-    /// today - #[allow(dead_code)] to keep the build warning-free
-    /// until that lands.
-    #[allow(dead_code)]
+    /// The engine's expected reply to `bestmove`, if it sent one -
+    /// the move to ponder on.
     pub ponder: Option<String>,
     /// Stats from the last "info" line seen before bestmove (i.e. the
     /// deepest completed iteration), if the engine sent any. Used to
     /// kibitz a summary of the search, e.g. "depth=17 score=1.87
     /// time=8.96 node=17234760 nps=1923522 pv=...".
     pub info: Option<EngineInfo>,
+    /// The move came from the engine's own opening book (`OwnBook`),
+    /// not a search. UCI has no message for that, so it's inferred:
+    /// no search info with a depth before `bestmove`, or an "info
+    /// string" saying "book move" (which some engines send).
+    pub from_book: bool,
 }
 
 /// Parsed fields from one UCI "info depth ... score ... nodes ... nps
@@ -176,7 +182,15 @@ impl UciEngine {
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let stdout = BufReader::new(stdout);
+        let (lines_tx, lines) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut stdout = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = stdout.next_line().await {
+                if lines_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
 
         // Engines occasionally write diagnostics to stderr (e.g. the
         // engine logging tablebase loading). Previously this was
@@ -204,7 +218,7 @@ impl UciEngine {
         let mut engine = UciEngine {
             child,
             stdin,
-            stdout,
+            lines,
             name: None,
         };
 
@@ -256,11 +270,11 @@ impl UciEngine {
     }
 
     async fn read_line(&mut self) -> Result<String> {
-        let mut buf = String::new();
-        let n = self.stdout.read_line(&mut buf).await?;
-        if n == 0 {
-            return Err(anyhow!("engine closed stdout (process likely exited)"));
-        }
+        let buf = self
+            .lines
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("engine closed stdout (process likely exited)"))?;
         let trimmed = buf.trim_end();
         debug!("<- engine: {}", trimmed);
         // "info string" is the UCI channel engines use for one-off
@@ -306,6 +320,7 @@ impl UciEngine {
     /// Start a timed search and wait for `bestmove`. Mirrors Go() +
     /// SendTimeToComputer() + waiting for the "move"/"<n> ... move" line
     /// in ProcessComputerLine.
+    #[cfg(test)]
     pub async fn go_and_wait(
         &mut self,
         white_time_ms: i64,
@@ -313,16 +328,46 @@ impl UciEngine {
         winc_ms: i64,
         binc_ms: i64,
     ) -> Result<SearchResult> {
+        self.go(white_time_ms, black_time_ms, winc_ms, binc_ms, false)
+            .await?;
+        self.wait_bestmove().await
+    }
+
+    /// Start a timed search (`go wtime ... binc ...`) without waiting
+    /// for its result - see `wait_bestmove`. With `ponder`, it's a
+    /// `go ponder` search of the position after the opponent's
+    /// expected reply, run on the opponent's time until `ponderhit`
+    /// (they played it) or `stop` (they didn't).
+    pub async fn go(
+        &mut self,
+        white_time_ms: i64,
+        black_time_ms: i64,
+        winc_ms: i64,
+        binc_ms: i64,
+        ponder: bool,
+    ) -> Result<()> {
         let cmd = format!(
-            "go wtime {} btime {} winc {} binc {}",
+            "go {}wtime {} btime {} winc {} binc {}",
+            if ponder { "ponder " } else { "" },
             white_time_ms.max(0),
             black_time_ms.max(0),
             winc_ms.max(0),
             binc_ms.max(0)
         );
-        self.send(&cmd).await?;
+        self.send(&cmd).await
+    }
 
+    /// The opponent played the move we were pondering on: the ponder
+    /// search carries on as a normal timed search, its result still
+    /// read with `wait_bestmove`.
+    pub async fn ponderhit(&mut self) -> Result<()> {
+        self.send("ponderhit").await
+    }
+
+    /// Wait for the running search's `bestmove`.
+    pub async fn wait_bestmove(&mut self) -> Result<SearchResult> {
         let mut last_info: Option<EngineInfo> = None;
+        let mut said_book = false;
         loop {
             let line = self.read_line().await?;
             let line = line.trim();
@@ -333,10 +378,13 @@ impl UciEngine {
                     .ok_or_else(|| anyhow!("bestmove line missing move"))?
                     .to_string();
                 let ponder = parts.nth(1).map(|s| s.to_string()); // skip the literal "ponder"
+                let searched = last_info.as_ref().is_some_and(|i| i.depth > 0);
+                let from_book = said_book || !searched;
                 return Ok(SearchResult {
                     bestmove,
                     ponder,
-                    info: last_info,
+                    info: if from_book { None } else { last_info },
+                    from_book,
                 });
             }
             // info lines (depth/score/pv/etc.) are logged but otherwise
@@ -345,6 +393,11 @@ impl UciEngine {
             // caller can kibitz a summary of the search once it's done.
             if line.starts_with("info ") {
                 debug!("engine info: {}", line);
+                if line.starts_with("info string ")
+                    && line.to_ascii_lowercase().contains("book move")
+                {
+                    said_book = true;
+                }
                 if let Some(parsed) = EngineInfo::parse(line) {
                     last_info = Some(parsed);
                 }
@@ -418,6 +471,7 @@ mod tests {
 import sys
 
 log = open(sys.argv[1], "w")
+pondering = False
 for line in sys.stdin:
     line = line.strip()
     log.write(line + "\n")
@@ -425,8 +479,18 @@ for line in sys.stdin:
     if line == "uci":
         print("id name FakeEngine")
         print("uciok")
+    elif line == "stop" and pondering:
+        pondering = False
+        print("bestmove a2a3")
     elif line == "isready":
         print("readyok")
+    elif line.startswith("go movetime 1"):
+        print("info string book move")
+        print("bestmove d2d4")
+    elif line.startswith("go movetime 2"):
+        print("bestmove c2c4")
+    elif line.startswith("go ponder"):
+        pondering = True  # thinks until "ponderhit" or "stop"
     elif line.startswith("go"):
         # Real engines are fast enough here that both lines are
         # typically already sitting in the pipe before a caller gets
@@ -434,6 +498,10 @@ for line in sys.stdin:
         # needs to handle.
         print("info depth 1 score cp 10 nodes 100 nps 100 time 10 pv e2e4")
         print("bestmove e2e4")
+    elif line == "ponderhit":
+        pondering = False
+        print("info depth 2 score cp 20 nodes 200 nps 200 time 20 pv g1f3")
+        print("bestmove g1f3 ponder b8c6")
     elif line == "quit":
         break
     sys.stdout.flush()
@@ -558,6 +626,52 @@ for line in sys.stdin:
         // earlier one was actually drained rather than just timed out.
         let result = engine.go_and_wait(60000, 60000, 0, 0).await.unwrap();
         assert_eq!(result.bestmove, "e2e4");
+
+        engine.quit().await.unwrap();
+        std::fs::remove_file(&script_path).ok();
+        std::fs::remove_file(&log_path).ok();
+    }
+
+    #[tokio::test]
+    async fn ponderhit_turns_a_ponder_search_into_the_real_one() {
+        let (script_path, log_path) = write_fake_engine();
+
+        let command_line = format!("python3 {} {}", script_path.display(), log_path.display());
+        let mut engine = UciEngine::spawn(&command_line, &BTreeMap::new()).await.unwrap();
+
+        engine.go(60000, 60000, 0, 0, true).await.unwrap();
+        engine.ponderhit().await.unwrap();
+        let result = engine.wait_bestmove().await.unwrap();
+        assert_eq!(result.bestmove, "g1f3");
+        assert_eq!(result.ponder.as_deref(), Some("b8c6"));
+        assert_eq!(result.info.map(|i| i.depth), Some(2));
+
+        engine.quit().await.unwrap();
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        std::fs::remove_file(&script_path).ok();
+        std::fs::remove_file(&log_path).ok();
+        assert!(log.contains("go ponder wtime 60000 btime 60000 winc 0 binc 0\nponderhit\n"));
+    }
+
+    #[tokio::test]
+    async fn recognizes_own_book_moves() {
+        let (script_path, log_path) = write_fake_engine();
+        let command_line = format!("python3 {} {}", script_path.display(), log_path.display());
+        let mut engine = UciEngine::spawn(&command_line, &BTreeMap::new()).await.unwrap();
+
+        // A real search.
+        let searched = engine.go_and_wait(60000, 60000, 0, 0).await.unwrap();
+        assert!(!searched.from_book);
+        assert!(searched.info.is_some());
+        // "info string book move", then bestmove.
+        engine.send_raw("go movetime 1").await.unwrap();
+        let said = engine.wait_bestmove().await.unwrap();
+        assert_eq!((said.bestmove.as_str(), said.from_book), ("d2d4", true));
+        // bestmove with no search info at all.
+        engine.send_raw("go movetime 2").await.unwrap();
+        let silent = engine.wait_bestmove().await.unwrap();
+        assert_eq!((silent.bestmove.as_str(), silent.from_book), ("c2c4", true));
+        assert!(silent.info.is_none());
 
         engine.quit().await.unwrap();
         std::fs::remove_file(&script_path).ok();

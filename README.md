@@ -17,7 +17,10 @@ and in `FICSPASSWD`/`ICSPASSWD`) to log in as a guest.
 
 To keep a record of every game the bot plays, set `SavePGN` to a file
 name, e.g. `"SavePGN": "games.pgn"`: each game is appended to it as
-PGN when it ends, ready to open in any chess program. Leave it out or
+PGN when it ends, ready to open in any chess program. Every move
+carries the clock time left after it (`[%clk 0:04:58]`), and the
+bot's own moves its engine's score/depth and the time it took
+(`{+0.35/18 2.1s}`, or `{book}` for book moves). Leave it out or
 set it to `""` to not save games.
 
 ### Command-line flags
@@ -189,16 +192,33 @@ are silently ignored.
   other than `"Yes"`), the board is plain ASCII with no escape codes
   at all - safe for any terminal, or when redirecting output to a
   file/log.
-  Just above the board, a short header is printed:
+  The board is drawn like FICS's `style 1`, from the bot's side
+  (Black at the bottom when it plays Black), with black pieces marked
+  `*` and the game's details down the right:
   ```
-  White: Erebus  Black: SomeHandle
-  Move: P/e2-e4
-  Clock: White 4:52  Black 4:58
+  Game 39 (Erebus vs. SomeHandle)
+
+         ---------------------------------
+      8  | *R| *N| *B| *Q| *K| *B| *N| *R|     Move # : 1 (Black)
+         |---+---+---+---+---+---+---+---|
+      7  | *P| *P| *P| *P| *P| *P| *P| *P|
+         |---+---+---+---+---+---+---+---|
+      6  |   |   |   |   |   |   |   |   |     White Moves : 'e4'  (0:02)
+         |---+---+---+---+---+---+---+---|
+      5  |   |   |   |   |   |   |   |   |
+         |---+---+---+---+---+---+---+---|
+      4  |   |   |   |   | P |   |   |   |     Black Clock : 5:00
+         |---+---+---+---+---+---+---+---|
+      3  |   |   |   |   |   |   |   |   |     White Clock : 4:58
+         |---+---+---+---+---+---+---+---|
+      2  | P | P | P | P |   | P | P | P |     Black Strength : 39
+         |---+---+---+---+---+---+---+---|
+      1  | R | N | B | Q | K | B | N | R |     White Strength : 39
+         ---------------------------------
+           a   b   c   d   e   f   g   h
+
   Kibitz: depth=17 score=1.87 time=8.96 node=17234760 nps=1923522 pv=...
   ```
-  The `White`/`Black` names, `Move` and `Clock` (each side's
-  remaining time as of that move) come from the current game's
-  style12 line;
   `Kibitz` is the most recent search-stats line from our own last
   move (see "Kibitzing search stats" below) and is only shown once
   we've made at least one move in the game - it's carried over from
@@ -229,6 +249,10 @@ are silently ignored.
   defaults (`Ponder`/`OwnBook` default to `"false"`, `NNUE` defaults
   to `"true"`) applied when that key isn't listed here at all, so you
   don't have to spell them out unless you want a non-default value.
+  With `"Ponder": "true"` the bot also ponders: after each move it
+  has the engine think on the opponent's time (`go ponder`) about the
+  reply it expects, sends `ponderhit` if the opponent plays it, and
+  `stop`s and searches afresh if they don't.
 - `Book`: path (absolute, or relative to the working directory the
   process was started from) to a Polyglot (`.bin`) opening book. When
   set, it's checked for a move before the engine is asked to search

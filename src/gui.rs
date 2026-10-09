@@ -8,13 +8,14 @@
 //! typed commands down the same channel the terminal prompt uses - so
 //! "tell", "engine ...", "quit" etc. behave identically in both.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::egui::{
     self, Align, Color32, FontId, Layout, Pos2, Rect, RichText, Sense, Shape, Stroke, TextStyle,
+    text::{LayoutJob, TextFormat},
     Vec2,
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -55,6 +56,8 @@ pub enum LineKind {
 
 pub struct ConsoleLine {
     pub kind: LineKind,
+    /// Local time the line arrived, "HH:MM:SS.mmm".
+    pub time: String,
     pub text: String,
 }
 
@@ -80,6 +83,9 @@ pub struct GuiState {
     /// The "{Game N (...) ...} result" line once the game has ended.
     pub game_over: Option<String>,
     pub moves: Vec<String>,
+    /// Plies of our moves that came from a book (ours or the engine's
+    /// own), highlighted in the move list.
+    pub book_plies: BTreeSet<usize>,
     pub search: Option<SearchView>,
     /// The engine's score after each of our moves this game, for the
     /// score chart.
@@ -94,6 +100,7 @@ impl GuiState {
     pub fn push_console(&mut self, kind: LineKind, text: impl Into<String>) {
         self.console.push_back(ConsoleLine {
             kind,
+            time: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
             text: text.into(),
         });
         while self.console.len() > MAX_CONSOLE_LINES {
@@ -112,17 +119,26 @@ impl GuiState {
                 .is_some_and(|(b, _)| b.game_number == board.game_number);
         if !same_game {
             self.moves.clear();
+            self.book_plies.clear();
             self.game_over = None;
             self.search = None;
             self.scores.clear();
         }
         record_move(&mut self.moves, board.ply(), &board.last_move_san);
+        // Anything later was taken back.
+        self.book_plies.split_off(&(board.ply() + 1));
         self.board = Some((board, Instant::now()));
+    }
+
+    /// Our move at `ply`, about to be played, is a book move.
+    pub fn mark_book(&mut self, ply: usize) {
+        self.book_plies.insert(ply);
     }
 }
 
 /// One point on the score chart: the engine's evaluation right after
-/// our move, from White's point of view (positive = White is better).
+/// our move, from our point of view (positive = we're better), the same
+/// as the engine panel, kibitz and PGN notes show it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScorePoint {
     /// Ply of our move (1 = White's first move).
@@ -135,14 +151,11 @@ pub struct ScorePoint {
 
 impl GuiState {
     /// Record the engine's evaluation `info` of the move we're about to
-    /// play from `board`. UCI scores are from the side to move (us), so
-    /// they're flipped when we're Black to keep the chart from White's
-    /// point of view, like Lichess.
+    /// play from `board`. UCI scores are from the side to move - us -
+    /// and are kept that way.
     pub fn push_score(&mut self, board: &Style12, info: &EngineInfo) {
-        let sign = if board.to_move_white { 1 } else { -1 };
         let (value, label) = match (info.score_mate, info.score_cp) {
             (Some(mate), _) => {
-                let mate = mate * sign;
                 if mate >= 0 {
                     (SCORE_CAP, format!("M{mate}"))
                 } else {
@@ -150,7 +163,7 @@ impl GuiState {
                 }
             }
             (None, Some(cp)) => {
-                let pawns = (cp * sign as i64) as f32 / 100.0;
+                let pawns = cp as f32 / 100.0;
                 (pawns.clamp(-SCORE_CAP, SCORE_CAP), format!("{pawns:+.2}"))
             }
             (None, None) => return,
@@ -228,6 +241,7 @@ pub fn run(shared: Arc<GuiShared>, cmd_tx: UnboundedSender<String>, title: Strin
                 input: String::new(),
                 history: Vec::new(),
                 history_pos: None,
+                confirm_resign: false,
             }))
         }),
     )
@@ -242,6 +256,8 @@ struct GuiApp {
     /// Commands sent from the console, for Up/Down recall.
     history: Vec<String>,
     history_pos: Option<usize>,
+    /// The Resign button was clicked once and is asking to confirm.
+    confirm_resign: bool,
 }
 
 impl eframe::App for GuiApp {
@@ -251,6 +267,16 @@ impl eframe::App for GuiApp {
 
         if state.finished {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // F toggles fullscreen - unless it's being typed into the
+        // console's input line (or another text field).
+        let ctx = ui.ctx().clone();
+        let toggle_fullscreen = !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.modifiers.is_none() && i.key_pressed(egui::Key::F));
+        if toggle_fullscreen {
+            let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
         }
 
         egui::Panel::bottom("status")
@@ -267,7 +293,10 @@ impl eframe::App for GuiApp {
             .resizable(true)
             .default_size(300.0)
             .min_size(220.0)
-            .show(ui, |ui| info_panel(ui, &state));
+            .show(ui, |ui| {
+                self.game_controls(ui, &mut state);
+                info_panel(ui, &state);
+            });
 
         egui::CentralPanel::default().show(ui, |ui| board_area(ui, &state));
 
@@ -279,6 +308,39 @@ impl eframe::App for GuiApp {
 }
 
 impl GuiApp {
+    /// A Resign button while a game is on, for when the operator thinks
+    /// the bot is lost (or playing badly). It sends FICS's `resign`
+    /// like a typed command, after a second click to confirm.
+    fn game_controls(&mut self, ui: &mut egui::Ui, state: &mut GuiState) {
+        if state.board.is_none() || state.game_over.is_some() {
+            self.confirm_resign = false;
+            return;
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if !self.confirm_resign {
+                if ui.button("Resign").on_hover_text("Resign this game").clicked() {
+                    self.confirm_resign = true;
+                }
+                return;
+            }
+            ui.label("Resign this game?");
+            let yes = egui::Button::new(RichText::new("Resign").color(Color32::WHITE))
+                .fill(LOW_TIME);
+            if ui.add(yes).clicked() {
+                self.confirm_resign = false;
+                if self.cmd_tx.send("resign".to_string()).is_err() {
+                    state.push_console(LineKind::Error, "Bot is not running; could not resign.");
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                self.confirm_resign = false;
+            }
+        });
+        ui.add_space(2.0);
+        ui.separator();
+    }
+
     fn console(&mut self, ui: &mut egui::Ui, state: &mut GuiState) {
         // Input line at the bottom, scrollback filling the rest.
         let input = egui::Panel::bottom("console_input")
@@ -319,6 +381,8 @@ impl GuiApp {
             .auto_shrink(false)
             .stick_to_bottom(true)
             .show(ui, |ui| {
+                let font = TextStyle::Monospace.resolve(ui.style());
+                let weak = ui.visuals().weak_text_color();
                 for line in &state.console {
                     let color = match line.kind {
                         LineKind::Server => ui.visuals().text_color(),
@@ -327,7 +391,14 @@ impl GuiApp {
                         LineKind::System => ui.visuals().weak_text_color(),
                         LineKind::Error => LOW_TIME,
                     };
-                    ui.label(RichText::new(&line.text).monospace().color(color));
+                    let mut job = LayoutJob::default();
+                    job.append(
+                        &line.time,
+                        0.0,
+                        TextFormat::simple(font.clone(), weak),
+                    );
+                    job.append(&line.text, 12.0, TextFormat::simple(font.clone(), color));
+                    ui.label(job);
                 }
             });
     }
@@ -423,7 +494,11 @@ fn info_panel(ui: &mut egui::Ui, state: &GuiState) {
     ui.separator();
     ui.heading("Score");
     ui.add_space(4.0);
-    score_chart(ui, &state.scores);
+    let board = state.board.as_ref().map(|(b, _)| b);
+    let we_are_white = board.is_none_or(|b| {
+        (b.relation == Relation::PlayingMyMove) == b.to_move_white
+    });
+    score_chart(ui, &state.scores, we_are_white);
 
     ui.add_space(10.0);
     ui.separator();
@@ -440,8 +515,22 @@ fn info_panel(ui: &mut egui::Ui, state: &GuiState) {
                 .show(ui, |ui| {
                     for (i, pair) in state.moves.chunks(2).enumerate() {
                         ui.weak(format!("{}.", i + 1));
-                        ui.monospace(&pair[0]);
-                        ui.monospace(pair.get(1).map(String::as_str).unwrap_or(""));
+                        for (j, san) in pair.iter().enumerate() {
+                            let ply = 2 * i + j + 1;
+                            if state.book_plies.contains(&ply) {
+                                // On the board's light-square blue.
+                                let text = RichText::new(san)
+                                    .monospace()
+                                    .color(Color32::BLACK)
+                                    .background_color(LIGHT_SQUARE);
+                                ui.label(text).on_hover_text("Book move");
+                            } else {
+                                ui.monospace(san);
+                            }
+                        }
+                        if pair.len() == 1 {
+                            ui.monospace("");
+                        }
                         ui.end_row();
                     }
                 });
@@ -452,10 +541,10 @@ fn info_panel(ui: &mut egui::Ui, state: &GuiState) {
         });
 }
 
-/// Line chart of the engine's score over the game, from White's point
-/// of view: White's advantage above the middle line, Black's below,
-/// shaded like Lichess's chart. Hovering shows the move and score.
-fn score_chart(ui: &mut egui::Ui, scores: &[ScorePoint]) {
+/// Line chart of the engine's score over the game. Hovering shows the
+/// move and score. `scores` are from our point of view; the area where we're ahead is
+/// shaded in our color, and the other side's where they are.
+fn score_chart(ui: &mut egui::Ui, scores: &[ScorePoint], we_are_white: bool) {
     let size = Vec2::new(ui.available_width(), SCORE_CHART_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter_at(rect);
@@ -496,8 +585,13 @@ fn score_chart(ui: &mut egui::Ui, scores: &[ScorePoint]) {
     // where the line crosses zero so every piece stays convex.
     let white_fill = Color32::from_white_alpha(70);
     let black_fill = Color32::from_black_alpha(90);
+    let (ahead_fill, behind_fill) = if we_are_white {
+        (white_fill, black_fill)
+    } else {
+        (black_fill, white_fill)
+    };
     let fill = |a: Pos2, b: Pos2| {
-        let color = if a.y + b.y < 2.0 * zero_y { white_fill } else { black_fill };
+        let color = if a.y + b.y < 2.0 * zero_y { ahead_fill } else { behind_fill };
         Shape::convex_polygon(
             vec![a, b, Pos2::new(b.x, zero_y), Pos2::new(a.x, zero_y)],
             color,
@@ -526,7 +620,8 @@ fn score_chart(ui: &mut egui::Ui, scores: &[ScorePoint]) {
     let axis_font = FontId::proportional(11.0);
     let axis_color = visuals.weak_text_color();
     painter.text(rect.left_top() + Vec2::new(4.0, 2.0), egui::Align2::LEFT_TOP, format!("+{range}"), axis_font.clone(), axis_color);
-    painter.text(rect.left_bottom() + Vec2::new(4.0, -2.0), egui::Align2::LEFT_BOTTOM, format!("-{range}"), axis_font, axis_color);
+    painter.text(rect.left_bottom() + Vec2::new(4.0, -2.0), egui::Align2::LEFT_BOTTOM, format!("-{range}"), axis_font.clone(), axis_color);
+    painter.text(rect.right_top() + Vec2::new(-4.0, 2.0), egui::Align2::RIGHT_TOP, "+ = us ahead", axis_font, axis_color);
 
     // Hover: the nearest point by x, marked, with its move and score.
     if let Some(pos) = response.hover_pos() {
@@ -734,6 +829,22 @@ mod tests {
     }
 
     #[test]
+    fn book_marks_follow_takebacks_and_new_games() {
+        let mut state = GuiState::default();
+        state.new_board(board("W -1 1 1 1 1 0 7 a b 1 1 0 39 39 60 60 1 none (0:00) none 0 0 0"));
+        state.mark_book(1);
+        state.new_board(board("B 4 1 1 1 1 0 7 a b -1 1 0 39 39 60 60 1 P/e2-e4 (0:00) e4 0 0 0"));
+        assert!(state.book_plies.contains(&1));
+        // Takeback to the start: the mark goes with the move.
+        state.new_board(board("W -1 1 1 1 1 0 7 a b 1 1 0 39 39 60 60 1 none (0:00) none 0 0 0"));
+        assert!(state.book_plies.is_empty());
+        state.mark_book(1);
+        state.game_over = Some("{Game 7 (a vs. b) b resigns} 1-0".to_string());
+        state.new_board(board("W -1 1 1 1 1 0 7 a b 1 1 0 39 39 60 60 1 none (0:00) none 0 0 0"));
+        assert!(state.book_plies.is_empty());
+    }
+
+    #[test]
     fn new_board_starts_a_fresh_game_after_game_over() {
         let mut state = GuiState::default();
         state.new_board(board("B 4 1 1 1 1 0 7 a b -1 1 0 39 39 60 60 1 P/e2-e4 (0:00) e4 0 0 0"));
@@ -780,33 +891,34 @@ mod tests {
     }
 
     #[test]
-    fn scores_are_from_whites_point_of_view() {
+    fn scores_are_from_our_point_of_view() {
         let mut state = GuiState::default();
-        // We're White to move at the start: +0.30 for us is +0.30.
+        // We're White to move at the start.
         let white_to_move = board("W -1 1 1 1 1 0 7 a b 1 1 0 39 39 60 60 1 none (0:00) none 0 0 0");
         state.push_score(&white_to_move, &info(Some(30), None));
-        // We're Black after 1. e4: +1.50 for us is -1.50 for White.
+        // We're Black after 1. e4: -0.90 for us stays -0.90, as the
+        // engine panel shows it.
         let black_to_move = board("B 4 1 1 1 1 0 7 a b 1 1 0 39 39 60 60 1 P/e2-e4 (0:00) e4 0 0 0");
-        state.push_score(&black_to_move, &info(Some(150), None));
+        state.push_score(&black_to_move, &info(Some(-90), None));
         assert_eq!(state.scores[0].ply, 1);
         assert_eq!(state.scores[0].value, 0.3);
         assert_eq!(state.scores[0].label, "+0.30");
         assert_eq!(state.scores[1].ply, 2);
-        assert_eq!(state.scores[1].value, -1.5);
-        assert_eq!(state.scores[1].label, "-1.50");
+        assert_eq!(state.scores[1].value, -0.9);
+        assert_eq!(state.scores[1].label, "-0.90");
     }
 
     #[test]
     fn mates_and_big_scores_sit_at_the_cap() {
         let mut state = GuiState::default();
         let black_to_move = board("B 4 1 1 1 1 0 7 a b 1 1 0 39 39 60 60 1 P/e2-e4 (0:00) e4 0 0 0");
-        // Black (us) mates in 3: Black is winning.
+        // We mate in 3.
         state.push_score(&black_to_move, &info(None, Some(3)));
-        assert_eq!((state.scores[0].value, state.scores[0].label.as_str()), (-SCORE_CAP, "-M3"));
+        assert_eq!((state.scores[0].value, state.scores[0].label.as_str()), (SCORE_CAP, "M3"));
         // Replaying the same ply replaces its score.
         state.push_score(&black_to_move, &info(Some(-3615), None));
         assert_eq!(state.scores.len(), 1);
-        assert_eq!((state.scores[0].value, state.scores[0].label.as_str()), (SCORE_CAP, "+36.15"));
+        assert_eq!((state.scores[0].value, state.scores[0].label.as_str()), (-SCORE_CAP, "-36.15"));
     }
 
     #[test]

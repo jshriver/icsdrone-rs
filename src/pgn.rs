@@ -4,12 +4,14 @@
 //! game is appended to the file when its "{Game N ...} result" line
 //! arrives.
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::board::Style12;
+use crate::engine::EngineInfo;
 
 /// PGN lines are wrapped at this width (the export format's usual 80).
 const LINE_WIDTH: usize = 80;
@@ -104,6 +106,11 @@ pub struct PgnGame {
     /// Ply of the first board we saw (0 for a game from the start).
     base_ply: usize,
     moves: Vec<String>,
+    /// Clock time left (ms) after each move, by ply, for `[%clk]`.
+    clocks: BTreeMap<usize, i64>,
+    /// Our engine's note on each of its moves ("+0.35/18 2.1s" or
+    /// "book"), by ply.
+    notes: BTreeMap<usize, String>,
 }
 
 impl PgnGame {
@@ -132,6 +139,8 @@ impl PgnGame {
             start_fen: (base_ply > 0).then(|| board.to_fen()),
             base_ply,
             moves: Vec::new(),
+            clocks: BTreeMap::new(),
+            notes: BTreeMap::new(),
         }
     }
 
@@ -140,7 +149,23 @@ impl PgnGame {
         let ply = board.ply();
         if ply > self.base_ply {
             record_move(&mut self.moves, ply - self.base_ply, &board.last_move_san);
+            // Anything recorded past this ply was taken back.
+            self.clocks.split_off(&(ply + 1));
+            self.notes.split_off(&(ply + 1));
+            // The side that just moved is the one not to move now.
+            let clock = if board.to_move_white {
+                board.black_time_ms
+            } else {
+                board.white_time_ms
+            };
+            self.clocks.insert(ply, clock);
         }
+    }
+
+    /// Attach our engine's `note` (see `engine_note`) to ply `ply`, the
+    /// move it's about to play.
+    pub fn annotate(&mut self, ply: usize, note: String) {
+        self.notes.insert(ply, note);
     }
 
     pub fn has_moves(&self) -> bool {
@@ -184,6 +209,16 @@ impl PgnGame {
                 tokens.push(format!("{number}..."));
             }
             tokens.push(san.clone());
+            let comment: Vec<String> = self
+                .notes
+                .get(&ply)
+                .cloned()
+                .into_iter()
+                .chain(self.clocks.get(&ply).map(|&ms| format!("[%clk {}]", clk(ms))))
+                .collect();
+            if !comment.is_empty() {
+                tokens.push(format!("{{{}}}", comment.join(" ")));
+            }
         }
         if !end.reason.is_empty() {
             tokens.push(format!("{{{}}}", end.reason.replace('}', ")")));
@@ -193,6 +228,27 @@ impl PgnGame {
         out.push_str("\n\n");
         out
     }
+}
+
+/// Our engine's note for a move: score from its point of view, search
+/// depth, and the time we spent, e.g. "+0.35/18 2.1s" or "-M3/22
+/// 0.4s" - the format cutechess and other GUIs write.
+pub fn engine_note(info: Option<&EngineInfo>, elapsed: Duration) -> String {
+    let secs = format!("{:.1}s", elapsed.as_secs_f64());
+    match info {
+        Some(info) => {
+            let score = info.score_string();
+            let sign = if score.starts_with(['-', '?']) { "" } else { "+" };
+            format!("{sign}{score}/{} {secs}", info.depth)
+        }
+        None => secs,
+    }
+}
+
+/// "h:mm:ss", the `[%clk]` format.
+fn clk(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
 /// Append `pgn` to the file at `path`, creating it if needed.
@@ -337,7 +393,7 @@ mod tests {
                 "[Event \"Unrated lightning game\"]\n[Site \"freechess.org\"]\n[Date \"{date}\"]\n\
                  [Round \"-\"]\n[White \"Alice\"]\n[Black \"Bob\"]\n[Result \"1-0\"]\n\
                  [WhiteElo \"1500\"]\n[TimeControl \"60+0\"]\n\n\
-                 1. e4 e5 {{Bob resigns}} 1-0\n\n"
+                 1. e4 {{[%clk 0:01:00]}} e5 {{[%clk 0:01:00]}} {{Bob resigns}} 1-0\n\n"
             )
         );
     }
@@ -361,7 +417,50 @@ mod tests {
         });
         assert!(pgn.contains("[Event \"?\"]"));
         assert!(pgn.contains("[SetUp \"1\"]\n[FEN \"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b"));
-        assert!(pgn.ends_with("1... e5 *\n\n"), "{pgn}");
+        assert!(pgn.ends_with("1... e5 {[%clk 0:01:00]} *\n\n"), "{pgn}");
+    }
+
+    #[test]
+    fn writes_engine_notes_and_clocks() {
+        let tail = |side: &str, mv: u32, wt: u32, bt: u32, verbose: &str, san: &str| {
+            format!("{side} -1 1 1 1 1 0 5 Bot Opp 1 5 0 39 39 {wt} {bt} {mv} {verbose} (0:00) {san} 0 0 0")
+        };
+        let first = board(START, &tail("W", 1, 300, 300, "none", "none"));
+        let mut game = PgnGame::new(&first, "x", None);
+        game.record(&first);
+        game.annotate(1, "book".into());
+        game.record(&board(AFTER_E4, &tail("B", 1, 299, 300, "P/e2-e4", "e4")));
+        game.record(&board(AFTER_E5, &tail("W", 2, 299, 3725, "P/e7-e5", "e5")));
+        // Annotated, then taken back before it was recorded again.
+        game.annotate(3, "stale".into());
+        game.record(&board(AFTER_E5, &tail("W", 2, 299, 3725, "P/e7-e5", "e5")));
+        let pgn = game.to_pgn(&GameEnd {
+            game_number: 5,
+            reason: String::new(),
+            result: "*".into(),
+        });
+        assert!(
+            pgn.ends_with("1. e4 {book [%clk 0:04:59]} e5 {[%clk 1:02:05]} *\n\n"),
+            "{pgn}"
+        );
+    }
+
+    #[test]
+    fn formats_engine_notes() {
+        let info = |cp, mate| EngineInfo {
+            depth: 18,
+            score_cp: cp,
+            score_mate: mate,
+            nodes: None,
+            nps: None,
+            time_ms: None,
+            pv: None,
+        };
+        let t = Duration::from_millis(2140);
+        assert_eq!(engine_note(Some(&info(Some(35), None)), t), "+0.35/18 2.1s");
+        assert_eq!(engine_note(Some(&info(Some(-120), None)), t), "-1.20/18 2.1s");
+        assert_eq!(engine_note(Some(&info(None, Some(3))), t), "+M3/18 2.1s");
+        assert_eq!(engine_note(None, t), "2.1s");
     }
 
     #[test]
