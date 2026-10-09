@@ -58,6 +58,9 @@ pub struct App {
     handle: String,
     game_number: Option<i32>,
     we_are_white: Option<bool>,
+    /// Who we're playing in the current game, so a game adjourned by a
+    /// dropped connection can be resumed with `match <opponent>`.
+    opponent: Option<String>,
     /// Name of a challenger whose "Challenge: ..." line we've seen but
     /// whose "you can accept/decline" confirmation line hasn't arrived
     /// yet. Mirrors the original's `parsingIncoming` + `name` state in
@@ -192,6 +195,7 @@ impl App {
             handle,
             game_number: None,
             we_are_white: None,
+            opponent: None,
             pending_challenger: None,
             kibitz_mode: config_file.resolve_kibitz(),
             color_board: config_file.resolve_color_board(),
@@ -397,6 +401,7 @@ impl App {
     fn reset_game(&mut self) {
         self.game_number = None;
         self.we_are_white = None;
+        self.opponent = None;
         self.last_kibitz = None;
         self.history = None;
         self.my_turn_line = None;
@@ -500,7 +505,13 @@ impl App {
                 ),
             );
             self.game_number = Some(board.game_number);
-            self.we_are_white = Some(board.white_name == self.handle);
+            let we_are_white = board.white_name == self.handle;
+            self.we_are_white = Some(we_are_white);
+            self.opponent = Some(if we_are_white {
+                board.black_name.clone()
+            } else {
+                board.white_name.clone()
+            });
             self.last_kibitz = None;
         }
 
@@ -714,7 +725,8 @@ impl App {
     /// The ICS connection dropped (`error`). Stop the engine, then
     /// reconnect and log back in, waiting longer between each failed
     /// attempt, until it works or the operator quits. If we were in a
-    /// game, FICS will have adjourned it, so ask to resume it.
+    /// game, the server will have adjourned it, so challenge the same
+    /// opponent again, which resumes it.
     async fn reconnect(&mut self, error: &anyhow::Error) -> Result<()> {
         warn!("ICS connection lost: {error:#}");
         if let Some(gui) = &self.gui {
@@ -728,7 +740,7 @@ impl App {
             &format!("Connection lost ({error:#}) - reconnecting"),
         );
         self.stop_pondering().await;
-        let was_playing = self.game_number.is_some();
+        let opponent = self.opponent.clone();
         self.reset_game();
 
         for attempt in 0.. {
@@ -767,11 +779,16 @@ impl App {
                             s.status = status;
                         });
                     }
-                    if was_playing {
-                        // FICS adjourns a game when a player drops;
-                        // this asks the opponent to carry on with it.
-                        notify(self.gui.as_deref(), "Asking to resume the adjourned game");
-                        self.ics.send("resume").await?;
+                    if let Some(opponent) = opponent {
+                        // The server adjourns a game when a player
+                        // drops, and challenging the same opponent
+                        // resumes it, clocks and all. (There's no
+                        // "resume" command on every server.)
+                        notify(
+                            self.gui.as_deref(),
+                            &format!("Asking {opponent} to resume the adjourned game"),
+                        );
+                        self.ics.send(&format!("match {opponent}")).await?;
                     }
                     return Ok(());
                 }

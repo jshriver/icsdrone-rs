@@ -338,10 +338,11 @@ set it to `"No"` to turn it off.
   retrying after 5s, 10s, 30s and then every 60s. The console and
   status bar show each attempt, and `quit` still works while it
   waits.
-- **Resuming games.** FICS adjourns a game when a player drops. After
-  reconnecting, the bot sends `resume` to ask the opponent to carry
-  on. With `SavePGN`, the moves before the drop aren't saved; the
-  recording restarts from the resumed position.
+- **Resuming games.** The server adjourns a game when a player drops.
+  After reconnecting, the bot sends `match <opponent>` to the player
+  it was playing, which resumes the adjourned game where it left off,
+  clocks included. With `SavePGN`, the moves before the drop aren't
+  saved; the recording restarts from the resumed position.
 
 ## Architecture
 
