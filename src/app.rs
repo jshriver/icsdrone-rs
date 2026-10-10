@@ -571,6 +571,15 @@ impl App {
         // Our clock is running from here; the PGN notes the time we took.
         let started = Instant::now();
 
+        // Checkmated or stalemated: the game-over line is on its way.
+        // Don't ask the engine - with no legal move it may answer with
+        // garbage (e.g. "c7d5b"), which would go to the ICS as a move.
+        if !san::has_legal_moves(&fen) {
+            info!("No legal moves (checkmate or stalemate); not searching");
+            self.stop_pondering().await;
+            return Ok(());
+        }
+
         // If the engine was pondering and the opponent played the
         // expected reply, that search is already well under way on
         // exactly this position: let it carry on as the real search.
@@ -638,6 +647,20 @@ impl App {
             // tracking, so there's no move left to send.
             None => return Ok(()),
         };
+
+        // Never send the ICS a move that isn't legal here - report it
+        // instead, and leave the move to the operator.
+        if !san::is_legal_move(&fen, &result.bestmove) {
+            let msg = format!(
+                "Engine's bestmove {} is illegal in {}; not sending it",
+                result.bestmove, fen
+            );
+            warn!("{msg}");
+            if let Some(gui) = &self.gui {
+                gui.console(LineKind::Error, msg);
+            }
+            return Ok(());
+        }
 
         if result.from_book {
             info!("Engine plays from its own book: {}", result.bestmove);
