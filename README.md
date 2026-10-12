@@ -395,8 +395,43 @@ the next search doesn't mistake it for its own result.
 
 ## Acknowledgements
 
-* Armando Hernandez Marroquin for the merida chess pieces (GPLv2+), taken from the Lichess repository, and for the TrueType diagram fonts behind the other "font" piece sets and the Diagram board (freeware).
-* The Lichess authors and the piece set artists for the other boards and pieces. Each set's author and license are in `assets/pieces/README.md` and `assets/boards/README.md`.
+### Thank you to the artists and Lichess
+
+The GUI's boards and pieces are the work of many generous people who
+shared their art freely. A big thank you to:
+
+* **[Lichess](https://lichess.org)** and the
+  [lila authors](https://github.com/lichess-org/lila/graphs/contributors),
+  for a free, open-source chess server and for making its boards and
+  piece sets available to everyone - all 26 Lichess boards here, and
+  the Governor and Kosal pieces, come from them.
+* **[pirouetti](https://lichess.org/@/pirouetti)** for the Lichess
+  boards (with the lila authors) and the Pirouetti pieces.
+* **Armando Hernandez Marroquin** (Colegio La Salle de San Cristobal,
+  Chiapas, Mexico) for the Merida pieces, and for the fifteen
+  TrueType diagram fonts behind the Adventurer, Alfonso-X, Condal,
+  Harlequin, Kingdom, Leipzig, Line, Lucena, Magnetic, Mark,
+  Marroquin, Mediaeval, Merida (font), Millennia and Motif sets and
+  the Diagram board.
+* **[Roland Chastain](https://github.com/rchastain2)** for
+  [Chess Image 2](https://github.com/rchastain2/chess-image-2), where
+  those fonts were collected.
+* **[Colin M.L. Burnett](https://en.wikipedia.org/wiki/User:Cburnett)** for the Cburnett pieces.
+* **[Maurizio Monge](https://github.com/maurimo/chess-art)** for the Celtic, Fantasy and Spatial pieces.
+* **[Alexis Luengas](https://github.com/LexLuengas)** for the Chessnut pieces.
+* **[James Faure](https://github.com/jfaure/Firi-pieceset)** for the Firi pieces.
+* **[neverRare](https://github.com/neverRare)** for the Kiwen-suwi pieces.
+* **[usolando](https://lichess.org/@/usolando)** for the Letter pieces.
+* **[Maxime Chupin](https://github.com/chupinmaxime)** for the Mpchess pieces.
+* **therealqtpi** for the Pixel pieces.
+* **[RhosGFX](https://rhosgfx.itch.io/)** for the Rhosgfx pieces.
+* **[flugsio](https://github.com/flugsio/chess_shapes)** for the Shapes pieces.
+
+Each set's license is in `assets/pieces/README.md` and
+`assets/boards/README.md` (`LICENSE-pieces.md` and
+`LICENSE-boards.md` in the release downloads).
+
+### And also
 
 * Joost Buijs for running nightmare-chess.nl ICS server and his monthly (C) tournaments.
 * Marcel van Kervinck fork of icsdrone https://github.com/kervinck/icsdrone
@@ -407,6 +442,11 @@ the next search doesn't mistake it for its own result.
 ## License
 
 icsdrone-rs is free software under the GNU Affero General Public
-License, version 3 or later - see `LICENSE`. The bundled boards and
-pieces keep their own licenses, listed in `assets/pieces/README.md`
-and `assets/boards/README.md`.
+License, version 3 or later - see `LICENSE`. Its source code is at
+<https://github.com/jshriver/icsdrone-rs>; each release's page there
+also has the source of that exact version.
+
+The boards and pieces built into the program keep their own
+licenses. Their authors and licenses are listed in
+`assets/pieces/README.md` and `assets/boards/README.md`, shipped in
+the release downloads as `LICENSE-pieces.md` and `LICENSE-boards.md`.

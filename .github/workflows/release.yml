@@ -7,7 +7,10 @@ name: Release
 #   git push origin v0.2.0
 #
 # Each matrix entry cross-builds a release binary for one platform,
-# packages it with README.md/config.example.json, and the final job
+# packages it with README.md/config.example.json and the license
+# files (LICENSE, plus the bundled boards' and pieces' authors and
+# licenses, which several of them require to travel with every
+# copy), and the final job
 # collects every package into one GitHub Release attached to that tag.
 on:
   push:
@@ -111,7 +114,9 @@ jobs:
           stage="${BIN_NAME}-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$stage/"
-          cp README.md config.example.json "$stage/"
+          cp README.md config.example.json LICENSE "$stage/"
+          cp assets/pieces/README.md "$stage/LICENSE-pieces.md"
+          cp assets/boards/README.md "$stage/LICENSE-boards.md"
           tar czf "${stage}.tar.gz" "$stage"
           echo "ASSET=${stage}.tar.gz" >> "$GITHUB_ENV"
 
@@ -122,7 +127,9 @@ jobs:
           $stage = "${env:BIN_NAME}-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "$stage/"
-          Copy-Item README.md, config.example.json "$stage/"
+          Copy-Item README.md, config.example.json, LICENSE "$stage/"
+          Copy-Item assets/pieces/README.md "$stage/LICENSE-pieces.md"
+          Copy-Item assets/boards/README.md "$stage/LICENSE-boards.md"
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           echo "ASSET=$stage.zip" >> $env:GITHUB_ENV
 
