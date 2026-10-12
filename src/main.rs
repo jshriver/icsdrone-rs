@@ -8,6 +8,7 @@ mod history;
 mod ics;
 mod pgn;
 mod san;
+mod theme;
 
 use std::sync::Arc;
 use std::time::Duration;

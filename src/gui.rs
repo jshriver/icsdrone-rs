@@ -1,5 +1,5 @@
 //! Optional desktop window (`"GUI": "Yes"` in config.json): the board
-//! with merida pieces, live clocks, the move list, engine stats, and
+//! (in a choice of board and piece themes), live clocks, the move list, engine stats, and
 //! a console that takes the same commands as the terminal `>` prompt.
 //!
 //! The bot keeps running on a background tokio thread and publishes
@@ -24,16 +24,13 @@ use crate::app::format_clock;
 use crate::board::{Relation, Style12};
 use crate::engine::EngineInfo;
 use crate::pgn::record_move;
+use crate::theme::{self, BOARDS, BoardTheme, PIECE_SETS, PieceSet};
 
 /// Oldest console lines are dropped past this. Kept small: the console
 /// is laid out in full on every frame, and a long scrollback costs CPU
 /// the engine could be using.
 const MAX_CONSOLE_LINES: usize = 100;
 
-// Board colors: the average light/dark square colors of Lichess's
-// "blue3" board (its textured image isn't bundled, just these colors).
-const LIGHT_SQUARE: Color32 = Color32::from_rgb(0xcb, 0xd4, 0xdd);
-const DARK_SQUARE: Color32 = Color32::from_rgb(0x56, 0x8a, 0xb6);
 const LAST_MOVE: Color32 = Color32::from_rgba_premultiplied(64, 82, 0, 105);
 const LOW_TIME: Color32 = Color32::from_rgb(0xe0, 0x40, 0x40);
 
@@ -247,6 +244,10 @@ impl GuiShared {
     }
 }
 
+/// Where the chosen themes are saved, in eframe's settings storage.
+const PIECES_KEY: &str = "pieces";
+const BOARD_KEY: &str = "board";
+
 /// Open the window and run it until it's closed. Blocks the calling
 /// thread, which must be the main thread.
 pub fn run(shared: Arc<GuiShared>, cmd_tx: UnboundedSender<String>, title: String) -> Result<()> {
@@ -255,6 +256,9 @@ pub fn run(shared: Arc<GuiShared>, cmd_tx: UnboundedSender<String>, title: Strin
             .with_title(&title)
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([640.0, 480.0]),
+        // Only the themes are saved (see `GuiApp::save`); the window
+        // opens at its usual size.
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -262,8 +266,13 @@ pub fn run(shared: Arc<GuiShared>, cmd_tx: UnboundedSender<String>, title: Strin
         options,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            // Start dark, whatever the system theme; ☀/🌙 and T still switch.
+            cc.egui_ctx.set_theme(egui::Theme::Dark);
             let _ = shared.ctx.set(cc.egui_ctx.clone());
+            let saved = |key| cc.storage.and_then(|s| s.get_string(key));
             Ok(Box::new(GuiApp {
+                pieces: theme::piece_set_index(saved(PIECES_KEY).as_deref()),
+                board: theme::board_index(saved(BOARD_KEY).as_deref()),
                 shared,
                 cmd_tx,
                 input: String::new(),
@@ -286,9 +295,23 @@ struct GuiApp {
     history_pos: Option<usize>,
     /// The Resign button was clicked once and is asking to confirm.
     confirm_resign: bool,
+    /// Chosen theme: indexes into `PIECE_SETS` and `BOARDS`.
+    pieces: usize,
+    board: usize,
 }
 
 impl eframe::App for GuiApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(PIECES_KEY, PIECE_SETS[self.pieces].id.to_string());
+        storage.set_string(BOARD_KEY, BOARDS[self.board].id.to_string());
+    }
+
+    /// Nothing else is remembered between runs: the theme toggle
+    /// starts dark every time, panels at their default sizes.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let shared = self.shared.clone();
         let mut state = shared.lock();
@@ -331,11 +354,13 @@ impl eframe::App for GuiApp {
             .default_size(300.0)
             .min_size(220.0)
             .show(ui, |ui| {
+                self.theme_pickers(ui);
                 self.game_controls(ui, &mut state);
-                info_panel(ui, &state);
+                info_panel(ui, &state, &BOARDS[self.board]);
             });
 
-        egui::CentralPanel::default().show(ui, |ui| board_area(ui, &state));
+        let (pieces, board) = (&PIECE_SETS[self.pieces], &BOARDS[self.board]);
+        egui::CentralPanel::default().show(ui, |ui| board_area(ui, &state, pieces, board));
 
         // Keep the running clock ticking: redraw just as its shown
         // second changes, rather than many times a second - every frame
@@ -354,6 +379,33 @@ impl eframe::App for GuiApp {
 }
 
 impl GuiApp {
+    /// Dropdowns for the piece set and the board.
+    fn theme_pickers(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Pieces");
+            egui::ComboBox::from_id_salt("pieces")
+                .selected_text(PIECE_SETS[self.pieces].name)
+                .height(400.0)
+                .show_ui(ui, |ui| {
+                    for (i, set) in PIECE_SETS.iter().enumerate() {
+                        ui.selectable_value(&mut self.pieces, i, set.name);
+                    }
+                });
+            ui.label("Board");
+            egui::ComboBox::from_id_salt("board")
+                .selected_text(BOARDS[self.board].name)
+                .height(400.0)
+                .show_ui(ui, |ui| {
+                    for (i, board) in BOARDS.iter().enumerate() {
+                        ui.selectable_value(&mut self.board, i, board.name);
+                    }
+                });
+        });
+        ui.add_space(2.0);
+        ui.separator();
+    }
+
     /// A Resign button while a game is on, for when the operator thinks
     /// the bot is lost (or playing badly). It sends FICS's `resign`
     /// like a typed command, after a second click to confirm.
@@ -500,7 +552,7 @@ fn status_bar(ui: &mut egui::Ui, state: &GuiState) {
     });
 }
 
-fn info_panel(ui: &mut egui::Ui, state: &GuiState) {
+fn info_panel(ui: &mut egui::Ui, state: &GuiState, board_theme: &BoardTheme) {
     ui.add_space(6.0);
     ui.heading("Engine");
     ui.add_space(4.0);
@@ -567,11 +619,11 @@ fn info_panel(ui: &mut egui::Ui, state: &GuiState) {
                         for (j, san) in pair.iter().enumerate() {
                             let ply = 2 * i + j + 1;
                             if state.book_plies.contains(&ply) {
-                                // On the board's light-square blue.
+                                // On the board's light-square color.
                                 let text = RichText::new(san)
                                     .monospace()
                                     .color(Color32::BLACK)
-                                    .background_color(LIGHT_SQUARE);
+                                    .background_color(board_theme.light);
                                 ui.label(text).on_hover_text("Book move");
                             } else {
                                 ui.monospace(san);
@@ -686,7 +738,7 @@ fn score_chart(ui: &mut egui::Ui, scores: &[ScorePoint], we_are_white: bool) {
 
 /// The board with a player bar (name and clock) above and below it.
 /// Our own side is always at the bottom.
-fn board_area(ui: &mut egui::Ui, state: &GuiState) {
+fn board_area(ui: &mut egui::Ui, state: &GuiState, pieces: &PieceSet, board_theme: &BoardTheme) {
     let board = state.board.as_ref().map(|(b, _)| b);
     // In a game we're playing, the side to move is us exactly when the
     // relation says it's our move.
@@ -709,7 +761,7 @@ fn board_area(ui: &mut egui::Ui, state: &GuiState) {
         let (top, bottom) = if we_are_white { (black, white) } else { (white, black) };
 
         player_bar(ui, state, top.0, top.1, top.2, bar_height);
-        let board_rect = draw_board(ui, board, !we_are_white, size);
+        let board_rect = draw_board(ui, board, !we_are_white, size, pieces, board_theme);
         player_bar(ui, state, bottom.0, bottom.1, bottom.2, bar_height);
 
         // Lichess-style material difference to the right of the board,
@@ -718,9 +770,10 @@ fn board_area(ui: &mut egui::Ui, state: &GuiState) {
             let icon = board_rect.width() / 8.0 * MATERIAL_ICON;
             let x = board_rect.right() + icon * 0.4;
             let top_y = board_rect.top() + icon * 0.2;
-            paint_material(ui, Pos2::new(x, top_y), &board.rows, top.2, icon);
+            let strip = board_theme.light;
+            paint_material(ui, Pos2::new(x, top_y), &board.rows, top.2, icon, pieces, strip);
             let bottom_y = board_rect.bottom() - icon * 1.2;
-            paint_material(ui, Pos2::new(x, bottom_y), &board.rows, bottom.2, icon);
+            paint_material(ui, Pos2::new(x, bottom_y), &board.rows, bottom.2, icon, pieces, strip);
         }
     });
 }
@@ -839,46 +892,52 @@ fn material_edge(rows: &[String; 8], white: bool) -> (Vec<u8>, i32) {
 const MATERIAL_COLUMN: f32 = 0.3;
 /// Size of its piece icons, as a fraction of a board square.
 const MATERIAL_ICON: f32 = 0.5;
-/// Behind the material icons: the board's light-square blue (as for
-/// book moves), on which both colors of piece show up, whatever the
-/// window's theme.
-const MATERIAL_STRIP: Color32 = LIGHT_SQUARE;
 
 /// Paint one side's material difference in a row starting at `at`
 /// (its top-left): small piece icons, then "+N" when that side is
 /// ahead. Pieces of one kind overlap a little, as on Lichess.
-/// `icon` is the icons' size in points.
-fn paint_material(ui: &egui::Ui, at: Pos2, rows: &[String; 8], white: bool, icon: f32) {
-    let (pieces, points) = material_edge(rows, white);
+/// `icon` is the icons' size in points. They sit on a `strip` of the
+/// board's light-square color (as for book moves), on which both
+/// colors of piece show up, whatever the window's theme.
+fn paint_material(
+    ui: &egui::Ui,
+    at: Pos2,
+    rows: &[String; 8],
+    white: bool,
+    icon: f32,
+    pieces: &PieceSet,
+    strip: Color32,
+) {
+    let (material, points) = material_edge(rows, white);
     // Where each icon goes, left to right.
-    let mut xs = Vec::with_capacity(pieces.len());
+    let mut xs = Vec::with_capacity(material.len());
     let mut x = at.x;
-    for (i, &piece) in pieces.iter().enumerate() {
+    for (i, &piece) in material.iter().enumerate() {
         if i > 0 {
-            let same = pieces[i - 1] == piece;
+            let same = material[i - 1] == piece;
             x += if same { icon * 0.55 } else { icon * 1.1 };
         }
         xs.push(x);
     }
-    if !pieces.is_empty() {
-        // On a light-square blue strip - straight on the window background,
+    if !material.is_empty() {
+        // On a light-square strip - straight on the window background,
         // white pieces vanish in the light theme and black ones in
         // the dark.
         let pad = icon * 0.15;
-        let strip = Rect::from_min_max(
+        let behind = Rect::from_min_max(
             Pos2::new(at.x - pad, at.y - pad),
             Pos2::new(x + icon + pad, at.y + icon + pad),
         );
-        ui.painter().rect_filled(strip, pad, MATERIAL_STRIP);
+        ui.painter().rect_filled(behind, pad, strip);
     }
-    for (&piece, &x) in pieces.iter().zip(&xs) {
-        if let Some(image) = piece_image(piece) {
+    for (&piece, &x) in material.iter().zip(&xs) {
+        if let Some(image) = pieces.image(piece) {
             let rect = Rect::from_min_size(Pos2::new(x, at.y), Vec2::splat(icon));
             egui::Image::new(image).paint_at(ui, rect);
         }
     }
     if points > 0 {
-        if !pieces.is_empty() {
+        if !material.is_empty() {
             x += icon * 1.3;
         }
         ui.painter().text(
@@ -898,9 +957,21 @@ const START_ROWS: [&str; 8] = [
 ];
 
 /// Draw the board; returns where it went.
-fn draw_board(ui: &mut egui::Ui, board: Option<&Style12>, flipped: bool, size: f32) -> Rect {
+fn draw_board(
+    ui: &mut egui::Ui,
+    board: Option<&Style12>,
+    flipped: bool,
+    size: f32,
+    pieces: &PieceSet,
+    theme: &BoardTheme,
+) -> Rect {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let painter = ui.painter_at(rect);
+    // A picture board isn't flipped with the pieces - as on Lichess.
+    let picture = theme.image();
+    if let Some(image) = &picture {
+        egui::Image::new(image.clone()).paint_at(ui, rect);
+    }
     let square = size / 8.0;
     let last_move = board.and_then(Style12::last_move_squares);
     let coord_font = FontId::proportional((square * 0.18).max(9.0));
@@ -912,13 +983,15 @@ fn draw_board(ui: &mut egui::Ui, board: Option<&Style12>, flipped: bool, size: f
             let min = rect.min + Vec2::new(screen_col as f32, screen_row as f32) * square;
             let sq = Rect::from_min_size(min, Vec2::splat(square));
             let light = (row + col) % 2 == 0;
-            painter.rect_filled(sq, 0.0, if light { LIGHT_SQUARE } else { DARK_SQUARE });
+            if picture.is_none() {
+                painter.rect_filled(sq, 0.0, if light { theme.light } else { theme.dark });
+            }
             if last_move.is_some_and(|(from, to)| from == (row, col) || to == (row, col)) {
                 painter.rect_filled(sq, 0.0, LAST_MOVE);
             }
 
             // Coordinates along the left and bottom edges, Lichess-style.
-            let coord_color = if light { DARK_SQUARE } else { LIGHT_SQUARE };
+            let coord_color = if light { theme.dark } else { theme.light };
             if screen_col == 0 {
                 painter.text(
                     sq.left_top() + Vec2::splat(square * 0.04),
@@ -940,31 +1013,12 @@ fn draw_board(ui: &mut egui::Ui, board: Option<&Style12>, flipped: bool, size: f
 
             let rows = board.map_or(START_ROWS, |b| b.rows.each_ref().map(String::as_str));
             let piece = rows[row].as_bytes().get(col).copied();
-            if let Some(image) = piece.and_then(piece_image) {
+            if let Some(image) = piece.and_then(|p| pieces.image(p)) {
                 egui::Image::new(image).paint_at(ui, sq);
             }
         }
     }
     rect
-}
-
-/// The merida image for a style12 piece letter (uppercase = White).
-fn piece_image(piece: u8) -> Option<egui::ImageSource<'static>> {
-    Some(match piece {
-        b'K' => egui::include_image!("../assets/pieces/merida/wK.svg"),
-        b'Q' => egui::include_image!("../assets/pieces/merida/wQ.svg"),
-        b'R' => egui::include_image!("../assets/pieces/merida/wR.svg"),
-        b'B' => egui::include_image!("../assets/pieces/merida/wB.svg"),
-        b'N' => egui::include_image!("../assets/pieces/merida/wN.svg"),
-        b'P' => egui::include_image!("../assets/pieces/merida/wP.svg"),
-        b'k' => egui::include_image!("../assets/pieces/merida/bK.svg"),
-        b'q' => egui::include_image!("../assets/pieces/merida/bQ.svg"),
-        b'r' => egui::include_image!("../assets/pieces/merida/bR.svg"),
-        b'b' => egui::include_image!("../assets/pieces/merida/bB.svg"),
-        b'n' => egui::include_image!("../assets/pieces/merida/bN.svg"),
-        b'p' => egui::include_image!("../assets/pieces/merida/bP.svg"),
-        _ => return None,
-    })
 }
 
 /// 17234760 -> "17,234,760".
@@ -1019,30 +1073,67 @@ mod tests {
         assert!(state.game_over.is_none());
     }
 
-    #[test]
-    fn every_piece_svg_renders() {
-        let ctx = egui::Context::default();
-        egui_extras::install_image_loaders(&ctx);
-        for &piece in b"KQRBNPkqrbnp" {
-            let Some(egui::ImageSource::Bytes { uri, bytes }) = piece_image(piece) else {
-                panic!("no image for {}", piece as char);
-            };
-            ctx.include_bytes(uri.clone(), bytes);
-            let hint = egui::SizeHint::Size {
-                width: 64,
-                height: 64,
-                maintain_aspect_ratio: false,
-            };
+    /// Render `image` at 64x64 and check something was drawn.
+    fn assert_renders(ctx: &egui::Context, image: egui::ImageSource<'static>) {
+        let egui::ImageSource::Bytes { uri, bytes } = image else {
+            panic!("not an embedded image");
+        };
+        ctx.include_bytes(uri.clone(), bytes);
+        let hint = egui::SizeHint::Size {
+            width: 64,
+            height: 64,
+            maintain_aspect_ratio: false,
+        };
+        // Pictures decode on a background thread: wait for them.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
             match ctx.try_load_image(&uri, hint) {
                 Ok(egui::load::ImagePoll::Ready { image }) => {
-                    assert_eq!(image.size, [64, 64], "{uri}");
+                    // Rasterized SVGs come out at the hint; pictures at their own size.
+                    if uri.ends_with(".svg") {
+                        assert_eq!(image.size, [64, 64], "{uri}");
+                    }
                     // Not just a blank square: some pixels are drawn.
                     assert!(image.pixels.iter().any(|p| p.a() > 0), "{uri} is empty");
+                    return;
+                }
+                Ok(egui::load::ImagePoll::Pending { .. }) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 Ok(egui::load::ImagePoll::Pending { .. }) => panic!("{uri} still loading"),
                 Err(e) => panic!("{uri} failed to render: {e}"),
             }
         }
+    }
+
+    #[test]
+    fn every_piece_and_board_renders() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        for set in PIECE_SETS {
+            for &piece in b"KQRBNPkqrbnp" {
+                let image = set.image(piece).unwrap_or_else(|| {
+                    panic!("{}: no image for {}", set.name, piece as char)
+                });
+                assert_renders(&ctx, image);
+            }
+        }
+        for board in BOARDS {
+            if let Some(image) = board.image() {
+                assert_renders(&ctx, image);
+            }
+        }
+    }
+
+    #[test]
+    fn theme_ids_are_unique_and_unknown_ones_fall_back() {
+        let ids: BTreeSet<_> = PIECE_SETS.iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), PIECE_SETS.len());
+        let ids: BTreeSet<_> = BOARDS.iter().map(|b| b.id).collect();
+        assert_eq!(ids.len(), BOARDS.len());
+        assert_eq!(theme::piece_set_index(Some("cburnett")), 1);
+        assert_eq!(theme::piece_set_index(Some("no-such-set")), 0);
+        assert_eq!(theme::board_index(None), 0);
     }
 
     fn info(cp: Option<i64>, mate: Option<i32>) -> EngineInfo {

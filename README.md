@@ -98,8 +98,13 @@ Logs go to stderr so they don't interleave with the prompt.
 With `"GUI": "Yes"` in config.json, a desktop window opens alongside
 the terminal (Windows, Linux and macOS):
 
-- **Board** with the merida pieces, the last move highlighted, and
-  your side at the bottom.
+- **Board** with the last move highlighted and your side at the
+  bottom. The **Pieces** and **Board** dropdowns at the top of the
+  right-hand panel pick the look: 31 piece sets (merida by default,
+  sets from Lichess, and Armando Marroquin's classic diagram fonts)
+  and 28 boards (the original flat blue by default, Lichess's boards,
+  and a hatched newspaper-style "Diagram"). The choice is remembered
+  between runs.
 - **Player bars** with names and clocks; the side to move's clock
   counts down live and turns red under 10 seconds.
 - **Material difference** to the right of the board, Lichess-style:
@@ -117,7 +122,7 @@ the terminal (Windows, Linux and macOS):
   move and exact score.
 - **Moves** list for the current game, with the result once it ends.
   The bot's book moves (from `Book` or the engine's own book) are
-  highlighted in light blue.
+  highlighted in the board's light-square color.
 - **Console** showing server output, our commands, kibitz and bot
   events, each line timestamped to the millisecond, with an input
   line that takes the same commands as the `>` prompt (Up/Down
@@ -149,8 +154,8 @@ sometimes loses the Wayland connection (`/run/user/<uid>` goes
 missing); the window then falls back to X11 automatically. If the
 window can't open at all, the reason is printed in the terminal.
 
-The window starts in the system's light/dark setting; the ☀/🌙
-button or **T** switches it for the rest of the session.
+The window starts in dark mode; the ☀/🌙 button or **T** switches it
+for the rest of the session.
 
 ### Config file
 
@@ -380,9 +385,18 @@ the next search doesn't mistake it for its own result.
 
 ## Acknowledgements
 
-* Armando Hernandez Marroquin for the merida chess pieces (GPLv2+), taken from the Lichess repository - see `assets/pieces/merida/README.md`.
+* Armando Hernandez Marroquin for the merida chess pieces (GPLv2+), taken from the Lichess repository, and for the TrueType diagram fonts behind the other "font" piece sets and the Diagram board (freeware).
+* The Lichess authors and the piece set artists for the other boards and pieces. Each set's author and license are in `assets/pieces/README.md` and `assets/boards/README.md`.
 
 * Joost Buijs for running nightmare-chess.nl ICS server and his monthly (C) tournaments.
 * Marcel van Kervinck fork of icsdrone https://github.com/kervinck/icsdrone
 * Henrik Gram original author of icsdrone https://sourceforge.net/projects/icsdrone/
 * Bob Hyatt for inspiring me to get into computer chess.
+
+
+## License
+
+icsdrone-rs is free software under the GNU Affero General Public
+License, version 3 or later - see `LICENSE`. The bundled boards and
+pieces keep their own licenses, listed in `assets/pieces/README.md`
+and `assets/boards/README.md`.
