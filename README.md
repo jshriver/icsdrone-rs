@@ -102,9 +102,9 @@ the terminal (Windows, Linux and macOS):
   bottom. The **Pieces** and **Board** dropdowns at the top of the
   right-hand panel pick the look: 31 piece sets (merida by default,
   sets from Lichess, and Armando Marroquin's classic diagram fonts)
-  and 28 boards (the original flat blue by default, Lichess's boards,
-  and a hatched newspaper-style "Diagram"). The choice is remembered
-  between runs.
+  and 27 boards (Lichess's Blue 3 by default, its other boards, and a
+  hatched newspaper-style "Diagram"). **Save**, next to them,
+  writes the choice to `gui_options` in config.json for next time.
 - **Player bars** with names and clocks; the side to move's clock
   counts down live and turns red under 10 seconds.
 - **Material difference** to the right of the board, Lichess-style:
@@ -185,6 +185,10 @@ is optional - see `config.example.json`:
     "Ponder": "false",
     "OwnBook": "false",
     "NNUE": "true"
+  },
+  "gui_options": {
+    "pieces": "Merida",
+    "board": "Blue 3"
   }
 }
 ```
@@ -203,6 +207,7 @@ is optional - see `config.example.json`:
 | `SavePGN` | path to a `.pgn` file | none (games aren't saved) |
 | `engine_options` | `{ "UCI option": "value", ... }` | `Ponder` `false`, `OwnBook` `false`, `NNUE` `true` |
 | `Book` | path to a Polyglot `.bin` | none |
+| `gui_options` | `{ "pieces": "<set>", "board": "<board>" }` | `Merida` pieces, `Blue 3` board |
 
 Yes/No values are case- and whitespace-insensitive. Keys are
 case-sensitive, and unknown keys (such as the removed `DisplayBoard`)
@@ -304,6 +309,11 @@ are silently ignored.
   entirely, or leaving it present but blank/whitespace-only (e.g. a
   template config that left the field empty rather than deleting it),
   are both treated the same way: no book.
+- `gui_options`: the GUI's piece set and board, by the names in its
+  **Pieces** and **Board** dropdowns (any case). A name it doesn't
+  know falls back to the default. The GUI's **Save** button writes
+  this section for you, keeping the rest of the file as it was (key
+  order included; the file is re-indented to 2 spaces).
 
 A missing config file is fine (every field falls back to its
 default/guest login); a malformed one is an error.

@@ -155,6 +155,7 @@ fn main() -> Result<()> {
         // so the bot runs on the runtime's background threads.
         let shared = GuiShared::new();
         let title = format!("icsdrone-rs - {}", config_file.resolve_username());
+        let (config_path, gui_options) = (config.config.clone(), config_file.gui_options.clone());
         let bot = runtime.spawn(run_bot(
             config,
             config_file,
@@ -162,7 +163,7 @@ fn main() -> Result<()> {
             cmd_tx.clone(),
             cmd_rx,
         ));
-        let gui_result = gui::run(shared, cmd_tx.clone(), title);
+        let gui_result = gui::run(shared, cmd_tx.clone(), title, config_path, &gui_options);
         // The window couldn't open (or crashed), so it can't show this
         // itself: the terminal is the only place left to say why.
         if let Err(e) = &gui_result {

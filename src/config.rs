@@ -100,7 +100,11 @@ impl KibitzMode {
 ///     "OwnBook": "false",
 ///     "NNUE": "true"
 ///   },
-///   "Book": "file.bin"
+///   "Book": "file.bin",
+///   "gui_options": {
+///     "pieces": "Merida",
+///     "board": "Blue 3"
+///   }
 /// }
 /// ```
 ///
@@ -152,6 +156,11 @@ impl KibitzMode {
 /// directory) to a Polyglot (`.bin`) opening book. When set, it's
 /// consulted for a book move before invoking the engine each turn -
 /// see `book::OpeningBook`.
+///
+/// `gui_options` picks the GUI's piece set and board by the names in
+/// its dropdowns (case-insensitive); unknown or absent names give the
+/// defaults. The GUI's Save button writes it back - see
+/// `save_gui_options`.
 #[derive(serde::Deserialize, Debug, Clone, Default)]
 pub struct ConfigFile {
     #[serde(default, rename = "Host")]
@@ -198,6 +207,40 @@ pub struct ConfigFile {
 
     #[serde(default, rename = "Book")]
     pub book: Option<PathBuf>,
+
+    #[serde(default)]
+    pub gui_options: GuiOptions,
+}
+
+/// The GUI's look, by theme name - see `ConfigFile`.
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default, PartialEq)]
+pub struct GuiOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pieces: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<String>,
+}
+
+/// Write `options` into the config file at `path` as `gui_options`,
+/// leaving every other key as it was (and in its order). Creates the
+/// file if it doesn't exist. Written to a temporary file first and
+/// renamed over, so a failed save can't leave half a config behind.
+pub fn save_gui_options(path: &Path, options: &GuiOptions) -> Result<()> {
+    let mut root = match std::fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let Some(map) = root.as_object_mut() else {
+        anyhow::bail!("{} is not a JSON object", path.display());
+    };
+    map.insert("gui_options".to_string(), serde_json::to_value(options)?);
+    let mut text = serde_json::to_string_pretty(&root)?;
+    text.push('\n');
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))
 }
 
 impl ConfigFile {
@@ -382,6 +425,36 @@ mod tests {
             cfg.engine_options.get("SyzygyPath").map(String::as_str),
             Some("/tbs")
         );
+    }
+
+    #[test]
+    fn saving_gui_options_keeps_the_rest_of_the_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("icsdrone-test-gui-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"Username": "bot", "GUI": "Yes", "engine_options": {"Threads": "4", "Hash": "256"}}"#,
+        )
+        .unwrap();
+        let options = GuiOptions {
+            pieces: Some("Cburnett".to_string()),
+            board: Some("Wood 4".to_string()),
+        };
+        save_gui_options(&path, &options).unwrap();
+        // Saving again replaces the section rather than adding another.
+        save_gui_options(&path, &options).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let cfg = ConfigFile::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.gui_options, options);
+        assert_eq!(cfg.username.as_deref(), Some("bot"));
+        assert_eq!(text.matches("gui_options").count(), 1);
+        // Keys stay in the file's own order, new section last.
+        let at = |key: &str| text.find(key).unwrap();
+        assert!(at("Username") < at("GUI") && at("GUI") < at("engine_options"));
+        assert!(at("Threads") < at("Hash") && at("Hash") < at("gui_options"));
     }
 
     #[test]

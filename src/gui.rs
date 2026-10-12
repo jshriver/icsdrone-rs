@@ -9,6 +9,7 @@
 //! "tell", "engine ...", "quit" etc. behave identically in both.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::format_clock;
 use crate::board::{Relation, Style12};
+use crate::config::{self, GuiOptions};
 use crate::engine::EngineInfo;
 use crate::pgn::record_move;
 use crate::theme::{self, BOARDS, BoardTheme, PIECE_SETS, PieceSet};
@@ -244,21 +246,24 @@ impl GuiShared {
     }
 }
 
-/// Where the chosen themes are saved, in eframe's settings storage.
-const PIECES_KEY: &str = "pieces";
-const BOARD_KEY: &str = "board";
-
 /// Open the window and run it until it's closed. Blocks the calling
-/// thread, which must be the main thread.
-pub fn run(shared: Arc<GuiShared>, cmd_tx: UnboundedSender<String>, title: String) -> Result<()> {
+/// thread, which must be the main thread. The look starts as
+/// `gui_options` says; Save writes it back to the config file at
+/// `config_path`.
+pub fn run(
+    shared: Arc<GuiShared>,
+    cmd_tx: UnboundedSender<String>,
+    title: String,
+    config_path: PathBuf,
+    gui_options: &GuiOptions,
+) -> Result<()> {
+    let pieces = theme::piece_set_index(gui_options.pieces.as_deref());
+    let board = theme::board_index(gui_options.board.as_deref());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&title)
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([640.0, 480.0]),
-        // Only the themes are saved (see `GuiApp::save`); the window
-        // opens at its usual size.
-        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -269,10 +274,11 @@ pub fn run(shared: Arc<GuiShared>, cmd_tx: UnboundedSender<String>, title: Strin
             // Start dark, whatever the system theme; ☀/🌙 and T still switch.
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             let _ = shared.ctx.set(cc.egui_ctx.clone());
-            let saved = |key| cc.storage.and_then(|s| s.get_string(key));
             Ok(Box::new(GuiApp {
-                pieces: theme::piece_set_index(saved(PIECES_KEY).as_deref()),
-                board: theme::board_index(saved(BOARD_KEY).as_deref()),
+                pieces,
+                board,
+                saved: (pieces, board),
+                config_path,
                 shared,
                 cmd_tx,
                 input: String::new(),
@@ -298,20 +304,13 @@ struct GuiApp {
     /// Chosen theme: indexes into `PIECE_SETS` and `BOARDS`.
     pieces: usize,
     board: usize,
+    /// The (pieces, board) last loaded from or saved to the config
+    /// file, so Save is only offered for a change.
+    saved: (usize, usize),
+    config_path: PathBuf,
 }
 
 impl eframe::App for GuiApp {
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(PIECES_KEY, PIECE_SETS[self.pieces].id.to_string());
-        storage.set_string(BOARD_KEY, BOARDS[self.board].id.to_string());
-    }
-
-    /// Nothing else is remembered between runs: the theme toggle
-    /// starts dark every time, panels at their default sizes.
-    fn persist_egui_memory(&self) -> bool {
-        false
-    }
-
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let shared = self.shared.clone();
         let mut state = shared.lock();
@@ -354,7 +353,7 @@ impl eframe::App for GuiApp {
             .default_size(300.0)
             .min_size(220.0)
             .show(ui, |ui| {
-                self.theme_pickers(ui);
+                self.theme_pickers(ui, &mut state);
                 self.game_controls(ui, &mut state);
                 info_panel(ui, &state, &BOARDS[self.board]);
             });
@@ -379,8 +378,9 @@ impl eframe::App for GuiApp {
 }
 
 impl GuiApp {
-    /// Dropdowns for the piece set and the board.
-    fn theme_pickers(&mut self, ui: &mut egui::Ui) {
+    /// Dropdowns for the piece set and the board, and Save to keep the
+    /// choice in the config file for next time.
+    fn theme_pickers(&mut self, ui: &mut egui::Ui, state: &mut GuiState) {
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             ui.label("Pieces");
@@ -401,9 +401,34 @@ impl GuiApp {
                         ui.selectable_value(&mut self.board, i, board.name);
                     }
                 });
+            let changed = (self.pieces, self.board) != self.saved;
+            let file = self.config_path.display().to_string();
+            let save = ui
+                .add_enabled(changed, egui::Button::new("Save"))
+                .on_hover_text(format!("Use these pieces and board next time (saved to {file})"))
+                .on_disabled_hover_text(format!("These are the pieces and board in {file}"));
+            if save.clicked() {
+                self.save_theme(state);
+            }
         });
         ui.add_space(2.0);
         ui.separator();
+    }
+
+    fn save_theme(&mut self, state: &mut GuiState) {
+        let options = GuiOptions {
+            pieces: Some(PIECE_SETS[self.pieces].name.to_string()),
+            board: Some(BOARDS[self.board].name.to_string()),
+        };
+        let file = self.config_path.display();
+        match config::save_gui_options(&self.config_path, &options) {
+            Ok(()) => {
+                self.saved = (self.pieces, self.board);
+                let (pieces, board) = (PIECE_SETS[self.pieces].name, BOARDS[self.board].name);
+                state.push_console(LineKind::System, format!("Saved {pieces} pieces on {board} board to {file}."));
+            }
+            Err(e) => state.push_console(LineKind::Error, format!("Could not save to {file}: {e:#}")),
+        }
     }
 
     /// A Resign button while a game is on, for when the operator thinks
@@ -967,11 +992,8 @@ fn draw_board(
 ) -> Rect {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let painter = ui.painter_at(rect);
-    // A picture board isn't flipped with the pieces - as on Lichess.
-    let picture = theme.image();
-    if let Some(image) = &picture {
-        egui::Image::new(image.clone()).paint_at(ui, rect);
-    }
+    // The picture isn't flipped with the pieces - as on Lichess.
+    egui::Image::new(theme.image()).paint_at(ui, rect);
     let square = size / 8.0;
     let last_move = board.and_then(Style12::last_move_squares);
     let coord_font = FontId::proportional((square * 0.18).max(9.0));
@@ -983,9 +1005,6 @@ fn draw_board(
             let min = rect.min + Vec2::new(screen_col as f32, screen_row as f32) * square;
             let sq = Rect::from_min_size(min, Vec2::splat(square));
             let light = (row + col) % 2 == 0;
-            if picture.is_none() {
-                painter.rect_filled(sq, 0.0, if light { theme.light } else { theme.dark });
-            }
             if last_move.is_some_and(|(from, to)| from == (row, col) || to == (row, col)) {
                 painter.rect_filled(sq, 0.0, LAST_MOVE);
             }
@@ -1119,9 +1138,7 @@ mod tests {
             }
         }
         for board in BOARDS {
-            if let Some(image) = board.image() {
-                assert_renders(&ctx, image);
-            }
+            assert_renders(&ctx, board.image());
         }
     }
 
@@ -1131,9 +1148,17 @@ mod tests {
         assert_eq!(ids.len(), PIECE_SETS.len());
         let ids: BTreeSet<_> = BOARDS.iter().map(|b| b.id).collect();
         assert_eq!(ids.len(), BOARDS.len());
+        // Save writes names, so they must be unique as well.
+        let names: BTreeSet<_> = PIECE_SETS.iter().map(|s| s.name.to_lowercase()).collect();
+        assert_eq!(names.len(), PIECE_SETS.len());
+        let names: BTreeSet<_> = BOARDS.iter().map(|b| b.name.to_lowercase()).collect();
+        assert_eq!(names.len(), BOARDS.len());
         assert_eq!(theme::piece_set_index(Some("cburnett")), 1);
         assert_eq!(theme::piece_set_index(Some("no-such-set")), 0);
         assert_eq!(theme::board_index(None), 0);
+        // By shown name too, as Save writes it, in any case.
+        assert_eq!(BOARDS[theme::board_index(Some(" blue 3 "))].id, "blue3");
+        assert_eq!(PIECE_SETS[theme::piece_set_index(Some("Merida (font)"))].id, "merida-font");
     }
 
     fn info(cp: Option<i64>, mate: Option<i32>) -> EngineInfo {

@@ -17,5 +17,9 @@
     "Ponder": "false",
     "OwnBook": "false",
     "NNUE": "true"
+  },
+  "gui_options": {
+    "pieces": "Merida",
+    "board": "Blue 3"
   }
 }

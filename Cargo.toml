@@ -12,10 +12,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: saving gui_options rewrites config.json in its own key order.
+serde_json = { version = "1", features = ["preserve_order"] }
 polyglot-book-rs = "0.1.0"
-# persistence: remembers the chosen board and piece themes.
-eframe = { version = "0.36.2", features = ["persistence"] }
+eframe = "0.36.2"
 egui_extras = { version = "0.36.2", features = ["svg", "image"] }
 # The JPEG/PNG decoders for the picture boards (egui_extras's "image"
 # loader turns no formats on by itself).

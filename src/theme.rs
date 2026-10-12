@@ -12,8 +12,9 @@ use eframe::egui::{self, Color32, ImageSource};
 const PIECE_ORDER: &[u8; 12] = b"KQRBNPkqrbnp";
 
 pub struct PieceSet {
-    /// Saved in the GUI's settings; never shown.
+    /// Also accepted in config.json's `gui_options`; never shown.
     pub id: &'static str,
+    /// As shown in the dropdown, and saved to `gui_options`.
     pub name: &'static str,
     /// `bytes://` URI and file contents, in `PIECE_ORDER`.
     images: [(&'static str, &'static [u8]); 12],
@@ -31,9 +32,8 @@ impl PieceSet {
 pub struct BoardTheme {
     pub id: &'static str,
     pub name: &'static str,
-    /// The whole board as one picture, or `None` to fill squares with
-    /// `light` and `dark`.
-    image: Option<(&'static str, &'static [u8])>,
+    /// The whole board as one picture.
+    image: (&'static str, &'static [u8]),
     /// Average square colors: for coordinates, book moves, and the
     /// strip behind the material difference.
     pub light: Color32,
@@ -41,8 +41,9 @@ pub struct BoardTheme {
 }
 
 impl BoardTheme {
-    pub fn image(&self) -> Option<ImageSource<'static>> {
-        self.image.map(|(uri, bytes)| source(uri, bytes))
+    pub fn image(&self) -> ImageSource<'static> {
+        let (uri, bytes) = self.image;
+        source(uri, bytes)
     }
 }
 
@@ -93,7 +94,7 @@ macro_rules! board {
         BoardTheme {
             id: $id,
             name: $name,
-            image: Some(asset!(concat!("../assets/boards/", $file))),
+            image: asset!(concat!("../assets/boards/", $file)),
             light: rgb($light),
             dark: rgb($dark),
         }
@@ -140,18 +141,11 @@ pub static PIECE_SETS: &[PieceSet] = &[
 /// The first is the default. Colors are each picture's average light
 /// and dark square.
 pub static BOARDS: &[BoardTheme] = &[
-    // Lichess's "blue3" colors, flat - the original look.
-    BoardTheme {
-        id: "flat-blue",
-        name: "Flat blue",
-        image: None,
-        light: Color32::from_rgb(0xcb, 0xd4, 0xdd),
-        dark: Color32::from_rgb(0x56, 0x8a, 0xb6),
-    },
+    // The default, from Lichess.
+    board!("blue3", "Blue 3", "blue3.jpg", 0xcad3dc, 0x568ab6),
     // From Lichess.
     board!("blue", "Blue", "blue.png", 0xdee3e6, 0x8ca2ad),
     board!("blue2", "Blue 2", "blue2.jpg", 0x88a1b6, 0x657e91),
-    board!("blue3", "Blue 3", "blue3.jpg", 0xcad3dc, 0x568ab6),
     board!("blue-marble", "Blue marble", "blue-marble.jpg", 0xe5e1d7, 0x959daa),
     board!("brown", "Brown", "brown.png", 0xf0d9b5, 0xb58863),
     board!("canvas", "Canvas", "canvas2.jpg", 0xcccfe1, 0x71819b),
@@ -179,12 +173,23 @@ pub static BOARDS: &[BoardTheme] = &[
     board!("diagram", "Diagram", "diagram.svg", 0xffffff, 0x5f5f5f),
 ];
 
-/// Index of the set saved as `id`, or the default.
-pub fn piece_set_index(id: Option<&str>) -> usize {
-    id.and_then(|id| PIECE_SETS.iter().position(|s| s.id == id)).unwrap_or(0)
+/// Does config.json's `wanted` name this theme? Its shown name or its
+/// id, ignoring case and surrounding spaces.
+fn named(wanted: &str, name: &str, id: &str) -> bool {
+    let wanted = wanted.trim();
+    wanted.eq_ignore_ascii_case(name) || wanted.eq_ignore_ascii_case(id)
 }
 
-/// Index of the board saved as `id`, or the default.
-pub fn board_index(id: Option<&str>) -> usize {
-    id.and_then(|id| BOARDS.iter().position(|b| b.id == id)).unwrap_or(0)
+/// Index of the set config.json names, or the default.
+pub fn piece_set_index(wanted: Option<&str>) -> usize {
+    wanted
+        .and_then(|w| PIECE_SETS.iter().position(|s| named(w, s.name, s.id)))
+        .unwrap_or(0)
+}
+
+/// Index of the board config.json names, or the default.
+pub fn board_index(wanted: Option<&str>) -> usize {
+    wanted
+        .and_then(|w| BOARDS.iter().position(|b| named(w, b.name, b.id)))
+        .unwrap_or(0)
 }
