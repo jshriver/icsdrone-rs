@@ -421,24 +421,6 @@ impl App {
         }
     }
 
-    /// The board render (plus any kibitz line) as it actually gets
-    /// printed, prefixed with an ANSI "clear screen, cursor home"
-    /// escape only when `ansi_ok` is true.
-    /// Callers pass `self.color_board` for `ansi_ok`: if a terminal
-    /// can't handle the square-highlighting escapes `to_board_string`
-    /// emits (that's what `ColorBoard: "No"` is for), it can't handle
-    /// *any* ANSI escape sequence, clear-screen included - so
-    /// `ColorBoard: "No"` needs to suppress this prefix too, not just
-    /// the highlighting, or the console never actually becomes free of
-    /// ANSI codes.
-    fn board_frame(board_str: &str, ansi_ok: bool) -> String {
-        if ansi_ok {
-            format!("\x1B[2J\x1B[1;1H{board_str}")
-        } else {
-            board_str.to_string()
-        }
-    }
-
     /// With `SavePGN` set, append the recorded game that `line` ("{Game
     /// N (...) reason} result") ends to the PGN file. Games that ended
     /// before any move (e.g. aborted) aren't saved.
@@ -469,13 +451,14 @@ impl App {
 
     /// Print `board` FICS style 1 (players, last move and clocks
     /// included), and the last kibitz under it, to the terminal, plain
-    /// or colored per `ColorBoard`.
+    /// or colored per `ColorBoard`. The screen isn't cleared first, so
+    /// earlier output (server lines, kibitzes) stays in the scrollback.
     fn print_board(&self, board: &Style12) {
         let mut text = board.to_board_string(self.color_board);
         if let Some(kibitz) = &self.last_kibitz {
             text.push_str(&format!("\n\nKibitz: {kibitz}"));
         }
-        println!("{}", Self::board_frame(&text, self.color_board));
+        println!("{text}");
     }
 
     async fn handle_style12(&mut self, line: &str) -> Result<()> {
@@ -1199,23 +1182,6 @@ mod tests {
         assert_eq!(to_ics_move("e2e4"), "e2e4");
         assert_eq!(to_ics_move("e1g1"), "e1g1");
         assert_eq!(to_ics_move("(none)"), "(none)");
-    }
-
-    #[test]
-    fn board_frame_prefixes_clear_screen_when_ansi_ok() {
-        let frame = App::board_frame("Game 1 (alice vs. bob)", true);
-        assert_eq!(frame, "\x1B[2J\x1B[1;1HGame 1 (alice vs. bob)");
-    }
-
-    #[test]
-    fn board_frame_omits_clear_screen_when_ansi_not_ok() {
-        // ColorBoard: "No" means the terminal can't handle ANSI at
-        // all, not just the square-highlighting codes - so the
-        // clear-screen escape must be left out too, or the console
-        // never actually becomes free of ANSI codes.
-        let frame = App::board_frame("Game 1 (alice vs. bob)", false);
-        assert_eq!(frame, "Game 1 (alice vs. bob)");
-        assert!(!frame.contains('\x1B'));
     }
 
     #[test]

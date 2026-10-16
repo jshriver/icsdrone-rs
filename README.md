@@ -229,10 +229,10 @@ are silently ignored.
 - `ColorBoard`: `"Yes"` or `"No"` (case/whitespace insensitive). The
   console board is always printed after every move; this only picks
   its style. With `"Yes"`, the previous move's from/to squares are
-  highlighted with ANSI colors and the screen is cleared before each
-  redraw, so the latest position replaces the previous one instead of
-  scrolling. With `"No"` (the default when omitted, or for any value
-  other than `"Yes"`), the board is plain ASCII with no escape codes
+  highlighted with ANSI colors; each board is printed below the
+  previous output (the screen isn't cleared). With `"No"` (the
+  default when omitted, or for any value other than `"Yes"`), the
+  board is plain ASCII with no escape codes
   at all - safe for any terminal, or when redirecting output to a
   file/log.
   The board is drawn like FICS's `style 1`, from the bot's side
