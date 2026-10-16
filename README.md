@@ -224,7 +224,7 @@ are silently ignored.
   the literal command `engine` (i.e. an executable named `engine` on
   `$PATH`) if omitted.
 - `Kibitz`: `"Yes"` or `"No"` (case/whitespace insensitive), whether to
-  whisper search stats after each move - see "Kibitzing search stats"
+  kibitz search stats after each move - see "Kibitzing search stats"
   below. Defaults to `"Yes"` if omitted.
 - `ColorBoard`: `"Yes"` or `"No"` (case/whitespace insensitive). The
   console board is always printed after every move; this only picks
@@ -322,18 +322,20 @@ default/guest login); a malformed one is an error.
 
 `Kibitz` in config.json (`"Yes"` or `"No"`, case/whitespace
 insensitive - `"yes"`, `"YES"`, `" yEs "` all count) turns on
-whispering the finished search behind each move, right before the move
-itself, via ICS "whisper" (visible only to observers of the game -
-there's deliberately no way to broadcast to the whole channel/room):
+kibitzing the finished search behind each move, right before the move
+itself, via ICS "kibitz" - seen by both players and everyone observing
+the game:
 
 ```
-whisper depth=17 score=1.87 time=8.96 node=17234760 nps=1923522 pv=e2e4 e7e5 g1f3 b8c6
+kibitz depth=17 score=1.87 time=8.96 node=17234760 nps=1923522 pv=e2e4 e7e5 g1f3 b8c6
 ```
 
 Field names/units match what the engine itself prints in its `info`
 line (score in pawns, time in seconds, mate scores as `M3`/`-M3`), just
 using the deepest completed iteration rather than every depth along the
-way. Book moves aren't kibitzed, since there's no search to report. On
+way. A move from the `Book` file is kibitzed with its Polyglot weight
+instead, e.g. `kibitz Book move: e2e4 weight=37`; moves from the
+engine's own book (`OwnBook`) aren't kibitzed. On
 by default (`Kibitz` defaults to `"Yes"` if omitted from config.json);
 set it to `"No"` to turn it off.
 

@@ -127,7 +127,7 @@ impl EngineInfo {
         }
     }
 
-    /// Format as a one-line kibitz/whisper summary, e.g.
+    /// Format as a one-line kibitz summary, e.g.
     /// "depth=17 score=1.87 time=8.96 node=17234760 nps=1923522 pv=O-O g3 Re8 ...".
     /// Mirrors the field names/units engines already print in their own
     /// "info" line (nps, not "speed"), just with score in pawns and

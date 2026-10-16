@@ -9,6 +9,14 @@ use polyglot_book_rs::PolyglotBook;
 use std::path::Path;
 use tracing::info;
 
+/// A book move and its Polyglot weight (higher = preferred).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookMove {
+    /// In the "e2e4"/"e7e8q" form the engine's `bestmove` uses.
+    pub mv: String,
+    pub weight: u16,
+}
+
 /// A loaded Polyglot (`.bin`) opening book, ready to be queried by FEN.
 pub struct OpeningBook {
     book: PolyglotBook,
@@ -34,15 +42,16 @@ impl OpeningBook {
         Ok(OpeningBook { book })
     }
 
-    /// Look up the highest-weighted book move for a position, in the
-    /// same "e2e4"/"e7e8q" move-string form the engine's own `bestmove`
-    /// uses, so it can be sent to the ICS the same way. Returns `None`
-    /// if the position isn't in the book (i.e. we're out of book and
-    /// should defer to the engine).
-    pub fn best_move_from_fen(&self, fen: &str) -> Option<String> {
-        self.book
-            .get_best_move_from_fen(fen)
-            .map(|entry| normalize_castling(&entry.move_string))
+    /// Look up the highest-weighted book move for a position, with its
+    /// weight. The move is in the same "e2e4"/"e7e8q" form the engine's
+    /// own `bestmove` uses, so it can be sent to the ICS the same way.
+    /// Returns `None` if the position isn't in the book (i.e. we're out
+    /// of book and should defer to the engine).
+    pub fn best_move_from_fen(&self, fen: &str) -> Option<BookMove> {
+        self.book.get_best_move_from_fen(fen).map(|entry| BookMove {
+            mv: normalize_castling(&entry.move_string),
+            weight: entry.weight,
+        })
     }
 }
 
@@ -112,7 +121,17 @@ mod tests {
         let book = OpeningBook::load(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN), Some("e2e4".to_string()));
+        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN).map(|m| m.mv), Some("e2e4".to_string()));
+    }
+
+    #[test]
+    fn book_move_carries_its_weight() {
+        let path = write_test_book(&[(STARTING_POS_KEY, 12, 28, 37)]);
+        let book = OpeningBook::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let found = book.best_move_from_fen(STARTING_POS_FEN).unwrap();
+        assert_eq!(found, BookMove { mv: "e2e4".to_string(), weight: 37 });
     }
 
     #[test]
@@ -122,7 +141,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let random_pos = "8/8/8/4k3/8/8/8/4K3 w - - 0 1";
-        assert_eq!(book.best_move_from_fen(random_pos), None);
+        assert_eq!(book.best_move_from_fen(random_pos).map(|m| m.mv), None);
     }
 
     #[test]
@@ -138,7 +157,7 @@ mod tests {
         let book = OpeningBook::load(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN), Some("e1g1".to_string()));
+        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN).map(|m| m.mv), Some("e1g1".to_string()));
     }
 
     #[test]
@@ -148,7 +167,7 @@ mod tests {
         let book = OpeningBook::load(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN), Some("e1c1".to_string()));
+        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN).map(|m| m.mv), Some("e1c1".to_string()));
     }
 
     #[test]
@@ -158,7 +177,7 @@ mod tests {
         let book = OpeningBook::load(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN), Some("e8g8".to_string()));
+        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN).map(|m| m.mv), Some("e8g8".to_string()));
     }
 
     #[test]
@@ -168,7 +187,7 @@ mod tests {
         let book = OpeningBook::load(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN), Some("e8c8".to_string()));
+        assert_eq!(book.best_move_from_fen(STARTING_POS_FEN).map(|m| m.mv), Some("e8c8".to_string()));
     }
 
     #[test]

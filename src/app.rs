@@ -72,8 +72,8 @@ pub struct App {
     /// config.json, default plain - see
     /// `ConfigFile::resolve_color_board`.
     color_board: bool,
-    /// Search-stats line from the most recent kibitz/whisper (see
-    /// `format_kibitz`), shown under the board on the following
+    /// The most recent kibitz - search stats (see `format_kibitz`) or
+    /// a book move - shown under the board on the following
     /// redraw so the operator can see it without scrolling back.
     /// Reset to `None` at the start of each new game (`reset_game`) -
     /// there's no "last move" to have kibitzed about yet.
@@ -612,8 +612,9 @@ impl App {
         } else {
             self.book.as_ref().and_then(|b| b.best_move_from_fen(&fen))
         };
-        if let Some(book_move) = book_move {
-            info!("Book move: {}", book_move);
+        if let Some(book) = book_move {
+            let book_move = book.mv;
+            info!("Book move: {} weight={}", book_move, book.weight);
             if let Some(gui) = &self.gui {
                 gui.update(|s| {
                     s.mark_book(board.ply() + 1);
@@ -628,6 +629,9 @@ impl App {
             if let Some(game) = &mut self.pgn_game {
                 game.annotate(board.ply() + 1, "book".to_string());
             }
+            // Like engines on ICS do: "Book move: f1e2 weight=2".
+            self.kibitz(format!("Book move: {} weight={}", book_move, book.weight))
+                .await?;
             self.ics.send(&to_ics_move(&book_move)).await?;
             return Ok(());
         }
@@ -680,24 +684,14 @@ impl App {
         // mirrors what a human kibitzing their own analysis would post,
         // e.g. "depth=17 score=1.87 time=8.96 node=17234760
         // nps=1923522 pv=O-O g3 Re8 ...". Sent *before* the move itself
-        // so observers see the reasoning land right alongside it. Also
-        // echoed to our own console: the ICS whisper is only visible to
-        // observers of the game, so without this the operator running
-        // the bot would never see it unless they were also observing
-        // from a separate ICS client. `last_kibitz` is remembered
-        // (regardless of `Kibitz`/whisper being on) so the next board
-        // redraw's "Kibitz:" header line has it even if whispering to
-        // ICS is turned off.
+        // so the players and observers see the reasoning land right
+        // alongside it. Also echoed to our own console, so the operator
+        // sees exactly what was announced. `last_kibitz` is remembered
+        // (regardless of `Kibitz` being on) so the next board redraw's
+        // "Kibitz:" header line has it even if kibitzing to ICS is
+        // turned off.
         if let Some(info) = result.info.as_ref() {
-            let stats = info.format_kibitz();
-            self.last_kibitz = Some(stats.clone());
-            if let Some(cmd) = self.kibitz_mode.ics_command() {
-                match &self.gui {
-                    Some(gui) => gui.console(LineKind::Kibitz, format!("[kibitz] {stats}")),
-                    None => println!("[kibitz] {stats}"),
-                }
-                self.ics.send(&format!("{cmd} {stats}")).await?;
-            }
+            self.kibitz(info.format_kibitz()).await?;
         }
         if let Some(gui) = &self.gui {
             gui.update(|s| {
@@ -742,6 +736,22 @@ impl App {
             });
         }
 
+        Ok(())
+    }
+
+    /// Announce `text` - search stats or a book move - with ICS
+    /// "kibitz" when `Kibitz` is on, echoed to our own console.
+    /// Remembered either way, for the "Kibitz:" line under the next
+    /// board.
+    async fn kibitz(&mut self, text: String) -> Result<()> {
+        self.last_kibitz = Some(text.clone());
+        if let Some(cmd) = self.kibitz_mode.ics_command() {
+            match &self.gui {
+                Some(gui) => gui.console(LineKind::Kibitz, format!("[kibitz] {text}")),
+                None => println!("[kibitz] {text}"),
+            }
+            self.ics.send(&format!("{cmd} {text}")).await?;
+        }
         Ok(())
     }
 

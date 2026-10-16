@@ -48,7 +48,7 @@ pub enum LineKind {
     Server,
     /// A command we typed (terminal or GUI console).
     Sent,
-    /// Our own search stats, as whispered.
+    /// Our own search stats, as kibitzed.
     Kibitz,
     /// Bot events: new game, game over, accepted challenge, ...
     System,

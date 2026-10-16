@@ -38,19 +38,16 @@ pub struct Config {
 
 /// Whether to announce search stats after each move as
 /// "depth=<d> score=<pawns> time=<s> node=<n> nps=<n> pv=<moves>"
-/// via ICS "whisper" (visible only to observers of the game) and on
-/// our own console (visible to the operator running the bot, even if
-/// they aren't separately observing the game). Controlled entirely by
-/// `Kibitz` in config.json (Yes/No) - there is deliberately no way to
-/// broadcast to the whole channel/room, only on/off. Whisper on by
-/// default.
+/// via ICS "kibitz" (seen by both players and everyone observing the
+/// game) and on our own console. Controlled entirely by `Kibitz` in
+/// config.json (Yes/No). On by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KibitzMode {
     /// Don't announce anything.
     Off,
-    /// Send via ICS "whisper" (visible only to observers of the game).
+    /// Send via ICS "kibitz" (both players and the observers see it).
     #[default]
-    Whisper,
+    Kibitz,
 }
 
 impl KibitzMode {
@@ -58,7 +55,7 @@ impl KibitzMode {
     pub fn ics_command(self) -> Option<&'static str> {
         match self {
             KibitzMode::Off => None,
-            KibitzMode::Whisper => Some("whisper"),
+            KibitzMode::Kibitz => Some("kibitz"),
         }
     }
 
@@ -68,7 +65,7 @@ impl KibitzMode {
     /// Anything else is treated as "No" (safe default: no chatter).
     fn from_str_flatten(s: &str) -> Self {
         if s.trim().eq_ignore_ascii_case("yes") {
-            KibitzMode::Whisper
+            KibitzMode::Kibitz
         } else {
             KibitzMode::Off
         }
@@ -116,10 +113,10 @@ impl KibitzMode {
 /// `Engine` is the command line used to launch the UCI engine; it
 /// falls back to "engine" if absent - see `resolve_engine`.
 ///
-/// `Kibitz` turns search-stat announcements (via ICS "whisper", never
-/// the public "kibitz" channel) on or off. Accepts "Yes"/"No" in any
-/// case or spacing ("yes", "YES", " yEs " all mean on); defaults to
-/// "Yes" (whisper on) if absent - see `resolve_kibitz`.
+/// `Kibitz` turns search-stat announcements (via ICS "kibitz", seen by
+/// both players and the observers) on or off. Accepts "Yes"/"No" in
+/// any case or spacing ("yes", "YES", " yEs " all mean on); defaults
+/// to "Yes" if absent - see `resolve_kibitz`.
 ///
 /// `ColorBoard` turns ANSI move-highlighting on the console board on
 /// or off. The board itself is always printed; this only picks
@@ -319,11 +316,11 @@ impl ConfigFile {
         })
     }
 
-    /// Whether to whisper search stats after each move: `Kibitz` from
+    /// Whether to kibitz search stats after each move: `Kibitz` from
     /// config.json, flattened case-/whitespace-insensitively to
     /// Yes/No ("yes", "YES", " yEs " etc. all count as "Yes"; anything
     /// else, including an unrecognized value, is treated as "No").
-    /// Defaults to "Yes" (whisper on) if `Kibitz` is absent entirely.
+    /// Defaults to "Yes" (kibitz on) if `Kibitz` is absent entirely.
     pub fn resolve_kibitz(&self) -> KibitzMode {
         match &self.kibitz {
             Some(s) => KibitzMode::from_str_flatten(s),
@@ -567,9 +564,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_kibitz_defaults_to_whisper_when_absent() {
+    fn resolve_kibitz_defaults_to_on_when_absent() {
         let cfg = ConfigFile::default();
-        assert_eq!(cfg.resolve_kibitz(), KibitzMode::Whisper);
+        assert_eq!(cfg.resolve_kibitz(), KibitzMode::Kibitz);
     }
 
     #[test]
@@ -577,7 +574,7 @@ mod tests {
         for s in ["Yes", "yes", "YES", "yEs", " Yes ", "yes\n"] {
             let mut cfg = ConfigFile::default();
             cfg.kibitz = Some(s.to_string());
-            assert_eq!(cfg.resolve_kibitz(), KibitzMode::Whisper, "input was {s:?}");
+            assert_eq!(cfg.resolve_kibitz(), KibitzMode::Kibitz, "input was {s:?}");
         }
     }
 
