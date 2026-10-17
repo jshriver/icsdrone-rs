@@ -134,6 +134,12 @@ the terminal (Windows, Linux and macOS):
   (when you're not typing in the console). The ☀/🌙 button in the
   status bar switches the theme too.
 
+The window has its own icon (`assets/icon.png`) in the title bar and
+taskbar on Windows and Linux, and in the Dock on macOS; on Windows the
+`.exe` carries it too (`assets/icon.ico`). Under Wayland (including
+WSLg) the desktop picks window icons from `.desktop` files instead, so
+a generic one may show there.
+
 The window is the whole interface, so it runs as a standalone app:
 nothing is printed to the terminal and the `>` prompt is off (use the
 window's console instead), `ColorBoard` is ignored, and on Windows the

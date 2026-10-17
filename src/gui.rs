@@ -263,7 +263,13 @@ pub fn run(
         viewport: egui::ViewportBuilder::default()
             .with_title(&title)
             .with_inner_size([1100.0, 760.0])
-            .with_min_inner_size([640.0, 480.0]),
+            .with_min_inner_size([640.0, 480.0])
+            // Title bar and taskbar on Windows and Linux/X11, the Dock on
+            // macOS. (Wayland takes window icons from .desktop files.)
+            .with_icon(Arc::new(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                    .expect("assets/icon.png is a valid PNG"),
+            )),
         ..Default::default()
     };
     eframe::run_native(

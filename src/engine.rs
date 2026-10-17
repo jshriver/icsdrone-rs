@@ -176,11 +176,22 @@ impl UciEngine {
         let args: Vec<&str> = parts.collect();
 
         info!("Starting engine: {}", command_line);
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // On Windows a console engine gets a console window of its own
+        // whenever we have none to share - as when the GUI has let go
+        // of ours - and it would pop up beside the GUI. It talks only
+        // through the pipes above, so start it without one.
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn engine `{program}`"))?;
 
