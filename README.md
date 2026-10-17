@@ -362,9 +362,8 @@ set it to `"No"` to turn it off.
   status bar show each attempt, and `quit` still works while it
   waits.
 - **Resuming games.** The server adjourns a game when a player drops.
-  After reconnecting, the bot sends `resume <opponent>` for the player
-  it was playing, which resumes the adjourned game where it left off,
-  clocks included. With `SavePGN`, the moves before the drop aren't
+  After reconnecting, the bot sends `resume`, which resumes the
+  adjourned game where it left off, clocks included. With `SavePGN`, the moves before the drop aren't
   saved; the recording restarts from the resumed position.
 
 ## Architecture
