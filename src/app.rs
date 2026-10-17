@@ -59,7 +59,7 @@ pub struct App {
     game_number: Option<i32>,
     we_are_white: Option<bool>,
     /// Who we're playing in the current game, so a game adjourned by a
-    /// dropped connection can be resumed with `match <opponent>`.
+    /// dropped connection can be resumed with `resume <opponent>`.
     opponent: Option<String>,
     /// Name of a challenger whose "Challenge: ..." line we've seen but
     /// whose "you can accept/decline" confirmation line hasn't arrived
@@ -741,8 +741,8 @@ impl App {
     /// The ICS connection dropped (`error`). Stop the engine, then
     /// reconnect and log back in, waiting longer between each failed
     /// attempt, until it works or the operator quits. If we were in a
-    /// game, the server will have adjourned it, so challenge the same
-    /// opponent again, which resumes it.
+    /// game, the server will have adjourned it, so ask to resume it
+    /// with the same opponent.
     async fn reconnect(&mut self, error: &anyhow::Error) -> Result<()> {
         warn!("ICS connection lost: {error:#}");
         if let Some(gui) = &self.gui {
@@ -797,14 +797,13 @@ impl App {
                     }
                     if let Some(opponent) = opponent {
                         // The server adjourns a game when a player
-                        // drops, and challenging the same opponent
-                        // resumes it, clocks and all. (There's no
-                        // "resume" command on every server.)
+                        // drops; "resume" picks it up again, clocks
+                        // and all, once the opponent agrees.
                         notify(
                             self.gui.as_deref(),
                             &format!("Asking {opponent} to resume the adjourned game"),
                         );
-                        self.ics.send(&format!("match {opponent}")).await?;
+                        self.ics.send(&resume_command(&opponent)).await?;
                     }
                     return Ok(());
                 }
@@ -1077,6 +1076,12 @@ fn is_quit_command(cmd: &str) -> bool {
     cmd.eq_ignore_ascii_case("quit") || cmd.eq_ignore_ascii_case("exit")
 }
 
+/// The ICS command that asks `opponent` to resume our adjourned game
+/// with them after a reconnect.
+fn resume_command(opponent: &str) -> String {
+    format!("resume {opponent}")
+}
+
 /// Convert a UCI/Polyglot coordinate move into the form the ICS accepts.
 /// Plain moves ("e2e4", and castling as "e1g1") are fine as-is, but a
 /// promotion's bare piece suffix ("a2a1q") isn't recognized as a move
@@ -1167,6 +1172,11 @@ mod tests {
             assert_eq!(login_result(line), Some(Err(())), "{line}");
         }
         assert_eq!(login_result("fics% tell bob logged in as guest"), None);
+    }
+
+    #[test]
+    fn reconnect_resumes_with_resume_not_match() {
+        assert_eq!(resume_command("atomFloyd"), "resume atomFloyd");
     }
 
     #[test]
